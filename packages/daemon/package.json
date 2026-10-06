@@ -1,0 +1,40 @@
+{
+  "name": "@pulserun/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PulseRun runner daemon: watches the escrow contract for jobs and executes them in isolated Docker sandboxes.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "pulserun-daemon": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^17.2.1",
+    "dockerode": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^4.0.1",
+    "@types/node": "^26.6.4",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "pulserun-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Developer CLI and runner daemon for the PulseRun protocol on Stellar.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/PulseRun-Labs/pulserun-client#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PulseRun-Labs/pulserun-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PulseRun-Labs/pulserun-client/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@12.3.4",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "test:coverage": "pnpm -r run test:coverage",
+    "lint": "pnpm run lint:format && pnpm run lint:eslint",
+    "lint:format": "prettier --check .",
+    "lint:eslint": "eslint .",
+    "format": "prettier --write .",
+    "cli": "pnpm --filter @pulserun/cli exec node ./dist/index.js",
+    "daemon": "pnpm --filter @pulserun/daemon exec node ./dist/index.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.4",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.1",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
+  }
+}
