@@ -31,7 +31,7 @@ import { type JobSpecStore, FileJobSpecStore } from './specs.js';
 import { JobWatcher } from './watcher.js';
 
 /** Version reported by `pulserun-daemon --version`. Keep in sync with package.json. */
-export const DAEMON_VERSION = '0.1.0';
+export const DAEMON_VERSION = '0.2.0';
 
 export const USAGE = `pulserun-daemon ${DAEMON_VERSION}
 Watches the PulseEscrow contract and executes jobs in Docker sandboxes.

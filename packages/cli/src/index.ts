@@ -16,7 +16,7 @@ import { registerStatusCommand } from './commands/status.js';
 import { createLogger } from './ui.js';
 
 /** Version reported by `pulserun --version`. Keep in sync with package.json. */
-export const CLI_VERSION = '0.1.0';
+export const CLI_VERSION = '0.2.0';
 
 /** Builds the commander program without parsing anything. */
 export function buildProgram(): Command {

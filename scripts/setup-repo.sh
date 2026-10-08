@@ -11,13 +11,12 @@
 set -euo pipefail
 
 REPO="${1:-PulseRun-Labs/pulserun-client}"
-GH=(gh -R "${REPO}")
 BRANCH="main"
 # Must match the job `name:` in .github/workflows/ci.yml exactly.
 REQUIRED_CHECK="Lint, typecheck, build and test"
 
 echo "==> Setting topics on ${REPO}"
-"${GH[@]}" repo edit \
+gh repo edit "${REPO}" \
   --add-topic stellar \
   --add-topic soroban \
   --add-topic cli \
@@ -28,7 +27,7 @@ echo "==> Setting topics on ${REPO}"
   --add-topic compute
 
 echo "==> Protecting ${BRANCH} on ${REPO}"
-"${GH[@]}" api --method PUT "repos/${REPO}/branches/${BRANCH}/protection" \
+gh api --method PUT "repos/${REPO}/branches/${BRANCH}/protection" \
   --input - <<JSON
 {
   "required_status_checks": {
