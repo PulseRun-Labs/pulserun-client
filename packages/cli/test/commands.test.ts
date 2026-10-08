@@ -1,27 +1,30 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it, vi } from 'vitest';
-import type { JobRecord, PulseRunClient } from '../src/client/soroban.js';
+import type { ComputeJob, PulseRunClient } from '../src/client/soroban.js';
 import { emitJson, jsonReplacer, runCommand, runExitCode } from '../src/commands/run.js';
 import { formatJob, statusCommand } from '../src/commands/status.js';
+import { cancelCommand, claimCommand, disputeCommand } from '../src/commands/lifecycle.js';
 import { buildProgram, formatError, isDirectExecution, main } from '../src/index.js';
 import { createLogger } from '../src/ui.js';
 
 const CONTRACT_ID = 'C'.padEnd(56, 'Z');
+const TOKEN_ID = 'C'.padEnd(56, 'T');
 const SECRET = Keypair.random().secret();
 const ADDRESS = 'G'.padEnd(56, 'A');
+const OTHER = 'G'.padEnd(56, 'B');
 
-const COMPLETED_JOB: JobRecord = {
-  id: 7n,
-  client: ADDRESS,
-  runner: ADDRESS,
-  image: 'node:22-alpine',
-  command: 'pnpm test',
-  maxBudgetStroops: 15_000_000n,
-  deadline: 2_000_000_000,
+const SETTLED_JOB: ComputeJob = {
+  jobId: 7n,
+  requester: ADDRESS,
+  runner: OTHER,
+  paymentToken: TOKEN_ID,
+  maxBudget: 15_000_000n,
+  ratePerSecond: 1_000n,
+  maxDurationSecs: 600,
+  status: 'Settled',
   createdAt: 1_999_999_000,
-  status: 'Completed',
+  completedAt: 1_999_999_500,
   outputHash: `0x${'ab'.repeat(32)}`,
-  exitCode: 0,
 };
 
 function collect(): { stream: NodeJS.WritableStream; text: () => string } {
@@ -40,8 +43,18 @@ function collect(): { stream: NodeJS.WritableStream; text: () => string } {
 function fakeClient(overrides: Partial<Record<keyof PulseRunClient, unknown>> = {}) {
   return {
     createJob: vi.fn(async () => ({ jobId: 7n, txHash: 'tx-hash', ledger: 12 })),
-    getJob: vi.fn(async () => COMPLETED_JOB),
-    waitForJob: vi.fn(async () => COMPLETED_JOB),
+    getJob: vi.fn(async () => SETTLED_JOB),
+    getProof: vi.fn(async () => ({
+      jobId: 7n,
+      durationSecs: 20,
+      exitCode: 0,
+      outputHash: `0x${'ab'.repeat(32)}`,
+    })),
+    getDisputeWindow: vi.fn(async () => 3_600),
+    waitForJob: vi.fn(async () => SETTLED_JOB),
+    claimPayout: vi.fn(async () => ({ earnings: 900n, txHash: 'tx-hash', ledger: 13 })),
+    disputeJob: vi.fn(async () => ({ txHash: 'tx-hash', ledger: 14 })),
+    cancelUnclaimedJob: vi.fn(async () => ({ txHash: 'tx-hash', ledger: 15 })),
     ...overrides,
   } as unknown as PulseRunClient;
 }
@@ -56,49 +69,47 @@ function silentLogger() {
   };
 }
 
-describe('runCommand', () => {
-  const baseOptions = {
-    image: 'node:22-alpine',
-    cmd: 'pnpm test',
-    maxBudget: '1.5',
-    key: SECRET,
-    contract: CONTRACT_ID,
-  };
+const baseOptions = {
+  runner: OTHER,
+  maxBudget: '1.5',
+  rate: '0.001',
+  token: TOKEN_ID,
+  key: SECRET,
+  contract: CONTRACT_ID,
+};
 
-  it('escrows a job and waits for the proof', async () => {
+describe('runCommand', () => {
+  it('escrows a job and waits for settlement', async () => {
     const client = fakeClient();
     const sink = silentLogger();
 
     const result = await runCommand(baseOptions, { client, logger: sink.logger });
 
     expect(result.submission.jobId).toBe(7n);
-    expect(result.job?.status).toBe('Completed');
+    expect(result.job?.status).toBe('Settled');
     expect(client.createJob).toHaveBeenCalledWith(
       expect.objectContaining({
-        image: 'node:22-alpine',
-        command: 'pnpm test',
-        maxBudgetXlm: '1.5',
+        runner: OTHER,
+        paymentToken: TOKEN_ID,
+        maxBudget: 15_000_000n,
+        ratePerSecond: 10_000n,
+        maxDurationSecs: 3_600,
       }),
     );
     expect(sink.out()).toContain('Job #7 escrowed');
-    expect(sink.out()).toContain('Completed');
+    expect(sink.out()).toContain('Settled');
   });
 
   it('returns immediately with --no-wait', async () => {
     const client = fakeClient();
-    const sink = silentLogger();
-
-    const result = await runCommand(
-      { ...baseOptions, wait: false },
-      { client, logger: sink.logger },
-    );
+    const result = await runCommand({ ...baseOptions, wait: false }, { client });
 
     expect(result.job).toBeNull();
     expect(client.waitForJob).not.toHaveBeenCalled();
     expect(runExitCode(result)).toBe(0);
   });
 
-  it('emits JSON when asked', async () => {
+  it('emits JSON when asked and mixes no human output', async () => {
     const client = fakeClient();
     const sink = silentLogger();
     const stdout = collect();
@@ -110,40 +121,42 @@ describe('runCommand', () => {
 
     const payload = JSON.parse(stdout.text());
     expect(payload.jobId).toBe('7');
-    expect(payload.job.status).toBe('Completed');
-    expect(payload.job.maxBudgetXlm).toBe('1.5');
-    // JSON mode must not mix in human output.
+    expect(payload.job.status).toBe('Settled');
+    expect(payload.job.maxBudget).toBe('15000000');
     expect(sink.out()).toBe('');
   });
 
-  it('validates required inputs before any network call', async () => {
+  it('validates inputs before any network call', async () => {
     const client = fakeClient();
-    await expect(runCommand({ ...baseOptions, image: ' ' }, { client })).rejects.toThrowError(
-      /Missing --image/,
-    );
-    await expect(runCommand({ ...baseOptions, cmd: '' }, { client })).rejects.toThrowError(
-      /Missing --cmd/,
+    await expect(runCommand({ ...baseOptions, runner: ' ' }, { client })).rejects.toThrowError(
+      /Missing --runner/,
     );
     await expect(
       runCommand({ ...baseOptions, maxBudget: 'nope' }, { client }),
-    ).rejects.toThrowError(/Invalid XLM amount/);
+    ).rejects.toThrowError(/Invalid amount/);
     expect(client.createJob).not.toHaveBeenCalled();
   });
 
-  it('requires a contract and a key', async () => {
+  it('requires a contract, a key and a token', async () => {
     await expect(runCommand({ ...baseOptions, contract: undefined })).rejects.toThrowError(
       /Missing escrow contract ID/,
     );
     await expect(runCommand({ ...baseOptions, key: undefined })).rejects.toThrowError(
       /Missing Stellar secret key/,
     );
+    await expect(runCommand({ ...baseOptions, token: undefined }, {})).rejects.toThrowError(
+      /Missing payment token ID/,
+    );
   });
 
-  it('maps failed jobs to a non-zero exit code', () => {
+  it('maps non-settled jobs to a non-zero exit code', () => {
+    expect(
+      runExitCode({ submission: { jobId: 1n, txHash: 'tx', ledger: 1 }, job: SETTLED_JOB }),
+    ).toBe(0);
     expect(
       runExitCode({
         submission: { jobId: 1n, txHash: 'tx', ledger: 1 },
-        job: { ...COMPLETED_JOB, status: 'Failed', exitCode: 1 },
+        job: { ...SETTLED_JOB, status: 'Refunded' },
       }),
     ).toBe(1);
     expect(runExitCode({ submission: { jobId: 1n, txHash: 'tx', ledger: 1 }, job: null })).toBe(0);
@@ -153,19 +166,15 @@ describe('runCommand', () => {
 describe('statusCommand', () => {
   it('renders a formatted job', async () => {
     const sink = silentLogger();
-    const json = await statusCommand(
+    const job = await statusCommand(
       7,
       { contract: CONTRACT_ID },
-      {
-        client: fakeClient(),
-        logger: sink.logger,
-        now: () => 1_999_999_000,
-      },
+      { client: fakeClient(), logger: sink.logger, now: () => 1_999_999_600 },
     );
 
-    expect(json.jobId).toBe('7');
+    expect(job.jobId).toBe(7n);
     expect(sink.out()).toContain('Job #7');
-    expect(sink.out()).toContain('1.5 XLM');
+    expect(sink.out()).toContain('Settled');
     expect(sink.out()).toContain(`0x${'ab'.repeat(32)}`);
   });
 
@@ -179,42 +188,28 @@ describe('statusCommand', () => {
         client: fakeClient(),
         logger: sink.logger,
         stdout: stdout.stream,
-        now: () => 1_999_999_000,
+        now: () => 1_999_999_600,
       },
     );
 
-    expect(JSON.parse(stdout.text()).status).toBe('Completed');
+    const payload = JSON.parse(stdout.text());
+    expect(payload.job.status).toBe('Settled');
+    expect(payload.proof.durationSecs).toBe(20);
     expect(sink.out()).toBe('');
   });
 
-  it('warns about unfinished and failed jobs', async () => {
-    const running = silentLogger();
+  it('warns about refunded jobs', async () => {
+    const sink = silentLogger();
     await statusCommand(
       7,
       { contract: CONTRACT_ID },
       {
-        client: fakeClient({
-          getJob: vi.fn(async () => ({ ...COMPLETED_JOB, status: 'Running' })),
-        }),
-        logger: running.logger,
-        now: () => 1_999_999_000,
+        client: fakeClient({ getJob: vi.fn(async () => ({ ...SETTLED_JOB, status: 'Refunded' })) }),
+        logger: sink.logger,
+        now: () => 1_999_999_600,
       },
     );
-    expect(running.out()).toContain('Still running');
-
-    const failed = silentLogger();
-    await statusCommand(
-      7,
-      { contract: CONTRACT_ID },
-      {
-        client: fakeClient({
-          getJob: vi.fn(async () => ({ ...COMPLETED_JOB, status: 'Expired' })),
-        }),
-        logger: failed.logger,
-        now: () => 1_999_999_000,
-      },
-    );
-    expect(failed.err()).toContain('finished as Expired');
+    expect(sink.err()).toContain('was refunded');
   });
 
   it('rejects malformed job ids', async () => {
@@ -225,15 +220,44 @@ describe('statusCommand', () => {
 });
 
 describe('formatJob', () => {
-  it('shows a friendly duration for the deadline', () => {
-    const rendered = formatJob({ ...COMPLETED_JOB, deadline: 1_999_999_120 }, 1_999_999_000);
+  it('shows a friendly expiry for queued jobs', () => {
+    const rendered = formatJob(
+      { ...SETTLED_JOB, status: 'Queued', createdAt: 1_999_999_000, maxDurationSecs: 120 },
+      null,
+      1_999_999_000,
+    );
     expect(rendered).toContain('2m 00s left');
-    expect(rendered).toMatch(/Command\s+pnpm test/);
+    expect(rendered).toMatch(/Status\s+Queued/);
+  });
+});
+
+describe('lifecycle commands', () => {
+  it('claims a payout', async () => {
+    const client = fakeClient();
+    const sink = silentLogger();
+    const result = await claimCommand(7, {}, { client, logger: sink.logger });
+    expect(result.earnings).toBe(900n);
+    expect(sink.out()).toContain('Job #7 settled');
   });
 
-  it('shows overdue deadlines as negative relative time', () => {
-    const rendered = formatJob({ ...COMPLETED_JOB, deadline: 1_999_998_970 }, 1_999_999_000);
-    expect(rendered).toContain('30s ago');
+  it('disputes a job', async () => {
+    const client = fakeClient();
+    const sink = silentLogger();
+    await disputeCommand(7, {}, { client, logger: sink.logger });
+    expect(sink.err()).toContain('disputed');
+  });
+
+  it('cancels an unclaimed job', async () => {
+    const client = fakeClient();
+    const sink = silentLogger();
+    await cancelCommand(7, {}, { client, logger: sink.logger });
+    expect(sink.out()).toContain('refunded');
+  });
+
+  it('emits JSON for claims', async () => {
+    const stdout = collect();
+    await claimCommand(7, { json: true }, { client: fakeClient(), stdout: stdout.stream });
+    expect(JSON.parse(stdout.text()).earnings).toBe('900');
   });
 });
 
@@ -250,9 +274,9 @@ describe('json helpers', () => {
 });
 
 describe('CLI wiring', () => {
-  it('registers the run and status commands', () => {
+  it('registers every command', () => {
     const names = buildProgram().commands.map((command) => command.name());
-    expect(names).toEqual(['run', 'status']);
+    expect(names).toEqual(['run', 'status', 'claim', 'dispute', 'cancel']);
   });
 
   it('returns 0 when help is requested', async () => {

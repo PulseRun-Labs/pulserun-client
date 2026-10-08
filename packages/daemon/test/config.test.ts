@@ -17,7 +17,7 @@ const SECRET = Keypair.random().secret();
 const RUNNER = Keypair.fromSecret(SECRET).publicKey();
 
 const BASE_ENV: NodeJS.ProcessEnv = {
-  PULSERUN_CONTRACT_ID: CONTRACT_ID,
+  PULSEESCROW_ID: CONTRACT_ID,
   PULSERUN_SECRET_KEY: SECRET,
 };
 
@@ -58,22 +58,31 @@ describe('loadConfig', () => {
     expect(config.networkPassphrase).toBe(TESTNET.networkPassphrase);
     expect(config.runnerPublicKey).toBe(RUNNER);
     expect(config.pollIntervalMs).toBe(DEFAULT_CONFIG.pollIntervalMs);
+    expect(config.jobSpecsFile).toBe(DEFAULT_CONFIG.jobSpecsFile);
     expect(config.cpuLimit).toBe(DEFAULT_CONFIG.cpuLimit);
     expect(config.allowNetwork).toBe(false);
+    expect(config.autoClaimPayout).toBe(true);
     expect(config.once).toBe(false);
+  });
+
+  it('accepts the legacy PULSERUN_CONTRACT_ID alias', () => {
+    const config = loadConfig({ PULSERUN_CONTRACT_ID: CONTRACT_ID, PULSERUN_SECRET_KEY: SECRET });
+    expect(config.contractId).toBe(CONTRACT_ID);
   });
 
   it('honours environment overrides', () => {
     const config = loadConfig({
       ...BASE_ENV,
       PULSERUN_NETWORK: 'local',
-      PULSERUN_RPC_URL: 'http://localhost:9000',
+      STELLAR_RPC_URL: 'http://localhost:9000',
       PULSERUN_POLL_INTERVAL_MS: '1500',
       PULSERUN_CPU_LIMIT: '2.5',
       PULSERUN_MEMORY_LIMIT_MB: '512',
       PULSERUN_ALLOW_NETWORK: 'yes',
       PULSERUN_JOB_TIMEOUT_SECONDS: '60',
       PULSERUN_MAX_CONCURRENCY: '4',
+      PULSERUN_AUTO_CLAIM: 'off',
+      PULSERUN_JOB_SPECS_FILE: '/tmp/specs.json',
       PULSERUN_LOG_LEVEL: 'DEBUG',
     });
 
@@ -85,6 +94,8 @@ describe('loadConfig', () => {
     expect(config.allowNetwork).toBe(true);
     expect(config.jobTimeoutSeconds).toBe(60);
     expect(config.maxConcurrency).toBe(4);
+    expect(config.autoClaimPayout).toBe(false);
+    expect(config.jobSpecsFile).toBe('/tmp/specs.json');
     expect(config.logLevel).toBe('debug');
   });
 
@@ -94,16 +105,16 @@ describe('loadConfig', () => {
 
   it('requires the contract id and secret key', () => {
     expect(() => loadConfig({ PULSERUN_SECRET_KEY: SECRET })).toThrowError(
-      /PULSERUN_CONTRACT_ID is required/,
+      /PULSEESCROW_ID is required/,
     );
-    expect(() => loadConfig({ PULSERUN_CONTRACT_ID: CONTRACT_ID })).toThrowError(
+    expect(() => loadConfig({ PULSEESCROW_ID: CONTRACT_ID })).toThrowError(
       /PULSERUN_SECRET_KEY is required/,
     );
   });
 
   it('rejects a malformed secret key', () => {
     expect(() =>
-      loadConfig({ PULSERUN_CONTRACT_ID: CONTRACT_ID, PULSERUN_SECRET_KEY: 'not-a-secret' }),
+      loadConfig({ PULSEESCROW_ID: CONTRACT_ID, PULSERUN_SECRET_KEY: 'not-a-secret' }),
     ).toThrowError(/not a valid Stellar secret key/);
   });
 
@@ -113,9 +124,6 @@ describe('loadConfig', () => {
     );
     expect(() => loadConfig({ ...BASE_ENV, PULSERUN_CPU_LIMIT: '0' })).toThrowError(
       /PULSERUN_CPU_LIMIT must be a number >= 0.1/,
-    );
-    expect(() => loadConfig({ ...BASE_ENV, PULSERUN_EVENT_PAGE_LIMIT: '500' })).toThrowError(
-      /PULSERUN_EVENT_PAGE_LIMIT must be <= 200/,
     );
     expect(() => loadConfig({ ...BASE_ENV, PULSERUN_POLL_INTERVAL_MS: 'whoops' })).toThrowError(
       /must be a number/,

@@ -1,22 +1,20 @@
 /**
  * `pulserun status <job_id>` — read and display on-chain job state.
  *
- * The command only performs a read-only simulation, so it works without a
+ * The command only performs read-only simulations, so it works without a
  * signing key.
  */
 
 import { type Command } from 'commander';
 import {
-  type JobJson,
-  type JobRecord,
+  type ComputeJob,
+  type ExecutionProofRecord,
   PulseRunClient,
-  PulseRunError,
   isTerminalStatus,
-  jobToJson,
-  stroopsToXlm,
+  formatTokenAmount,
   toJobId,
 } from '../client/soroban.js';
-import { resolveConnection } from '../config.js';
+import { parseDecimals, resolveConnection } from '../config.js';
 import {
   type Logger,
   createLogger,
@@ -24,13 +22,14 @@ import {
   formatTimestamp,
   shortenAddress,
 } from '../ui.js';
-import { emitJson } from './run.js';
+import { emitJson, jobToJson } from './run.js';
 
 export interface StatusOptions {
   network?: string;
   rpcUrl?: string;
   contract?: string;
   key?: string;
+  decimals?: string;
   json?: boolean;
 }
 
@@ -43,32 +42,45 @@ export interface StatusDependencies {
   now?: () => number;
 }
 
-/** Human-readable, aligned rendering of a job record. */
-export function formatJob(job: JobRecord, nowSeconds: number): string {
-  const remaining = job.deadline - nowSeconds;
-  const remainingLabel =
-    remaining >= 0 ? `${formatDuration(remaining)} left` : `${formatDuration(-remaining)} ago`;
-
+/** Human-readable, aligned rendering of a job record plus its proof. */
+export function formatJob(
+  job: ComputeJob,
+  proof: ExecutionProofRecord | null,
+  nowSeconds: number,
+  decimals = 7,
+): string {
   const rows: Array<[string, string]> = [
     ['Status', job.status],
-    ['Client', shortenAddress(job.client)],
+    ['Requester', shortenAddress(job.requester)],
     ['Runner', shortenAddress(job.runner)],
-    ['Image', job.image],
-    ['Command', job.command],
-    ['Budget', `${stroopsToXlm(job.maxBudgetStroops)} XLM`],
+    ['Payment token', shortenAddress(job.paymentToken)],
+    ['Max budget', `${formatTokenAmount(job.maxBudget, decimals)} (base units)`],
+    ['Rate / second', formatTokenAmount(job.ratePerSecond, decimals)],
+    ['Max duration', formatDuration(job.maxDurationSecs)],
     ['Created', formatTimestamp(job.createdAt)],
-    ['Deadline', `${formatTimestamp(job.deadline)} (${remainingLabel})`],
-    ['Output hash', job.outputHash ?? '—'],
-    ['Exit code', job.exitCode === null ? '—' : String(job.exitCode)],
+    [
+      'Expires',
+      job.status === 'Queued'
+        ? `${formatTimestamp(job.createdAt + job.maxDurationSecs)} (${formatDuration(
+            job.createdAt + job.maxDurationSecs - nowSeconds,
+          )} ${job.createdAt + job.maxDurationSecs - nowSeconds >= 0 ? 'left' : 'ago'})`
+        : '—',
+    ],
+    ['Completed', job.completedAt === 0 ? '—' : formatTimestamp(job.completedAt)],
+    ['Output hash', job.outputHash],
   ];
+  if (proof) {
+    rows.push(['Proof duration', `${proof.durationSecs}s`]);
+    rows.push(['Exit code', String(proof.exitCode)]);
+  }
 
   const width = rows.reduce((max, [label]) => Math.max(max, label.length), 0);
-  const header = `Job #${job.id}`;
+  const header = `Job #${job.jobId}`;
   return [header, ...rows.map(([label, value]) => `  ${label.padEnd(width)}  ${value}`)].join('\n');
 }
 
 /**
- * Reads a job and renders it.
+ * Reads a job (and its proof) and renders it.
  *
  * @throws {PulseRunError} when the job id is malformed or the read fails.
  */
@@ -76,10 +88,11 @@ export async function statusCommand(
   jobId: string | number | bigint,
   options: StatusOptions = {},
   deps: StatusDependencies = {},
-): Promise<JobJson> {
+): Promise<ComputeJob> {
   const logger = deps.logger ?? createLogger();
   const stdout = deps.stdout ?? process.stdout;
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
+  const decimals = parseDecimals(options.decimals);
 
   const id = toJobId(jobId);
   const connection = resolveConnection(options);
@@ -95,42 +108,41 @@ export async function statusCommand(
       : new PulseRunClient(endpoints));
 
   const job = await client.getJob(id);
+  const proof = await client.getProof(id);
   const nowSeconds = now();
 
   if (options.json) {
-    const json = jobToJson(job, nowSeconds);
-    emitJson(stdout, json);
-    return json;
+    emitJson(stdout, {
+      job: jobToJson(job, decimals),
+      proof: proof ? { ...proof, jobId: proof.jobId.toString() } : null,
+    });
+    return job;
   }
 
-  logger.info(formatJob(job, nowSeconds));
+  logger.info(formatJob(job, proof, nowSeconds, decimals));
 
   if (!isTerminalStatus(job.status)) {
-    logger.info(
-      `Still ${job.status.toLowerCase()}; the runner has ${formatDuration(job.deadline - nowSeconds)} to submit a proof.`,
-    );
-  } else if (job.status !== 'Completed') {
-    logger.warn(`Job #${job.id} finished as ${job.status}.`);
+    logger.info(`Job #${job.jobId} is ${job.status.toLowerCase()}; no payout is final yet.`);
+  } else if (job.status === 'Refunded') {
+    logger.warn(`Job #${job.jobId} was refunded to the requester.`);
   }
 
-  return jobToJson(job, nowSeconds);
+  return job;
 }
 
 /** Registers the `status` subcommand on the root program. */
 export function registerStatusCommand(program: Command): void {
   program
     .command('status')
-    .description('Show on-chain status, time remaining and output hash for a job.')
+    .description('Show on-chain status, timing and output hash for a job.')
     .argument('<job_id>', 'on-chain job id')
     .option('--network <name>', 'testnet | futurenet | mainnet | local')
     .option('--rpc-url <url>', 'Soroban RPC endpoint override')
-    .option('--contract <id>', 'PulseRun escrow contract ID (C...)')
+    .option('--contract <id>', 'PulseEscrow contract ID (C...)')
     .option('--key <secret>', 'optional Stellar secret key used as the RPC source account')
+    .option('--decimals <n>', 'payment token decimal precision', '7')
     .option('--json', 'emit machine-readable JSON')
     .action(async (rawJobId: string, options: StatusOptions) => {
-      if (!rawJobId?.trim()) {
-        throw new PulseRunError('Missing job id: usage `pulserun status <job_id>`.');
-      }
       await statusCommand(rawJobId, options);
     });
 }

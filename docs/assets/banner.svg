@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="PulseRun Client">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0b14"/>
+      <stop offset="1" stop-color="#1a1233"/>
+    </linearGradient>
+    <linearGradient id="pulse" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7D00FF"/>
+      <stop offset="1" stop-color="#4FC3F7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="320" rx="24" fill="url(#bg)"/>
+  <polyline points="120,170 320,170 360,110 410,230 460,90 510,170 760,170"
+            fill="none" stroke="url(#pulse)" stroke-width="10" stroke-linecap="round"
+            stroke-linejoin="round"/>
+  <text x="120" y="255" fill="#ffffff" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="58" font-weight="700">PulseRun Client</text>
+  <text x="820" y="170" fill="#c9c2ff" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="28">pay-per-run compute</text>
+  <text x="820" y="212" fill="#8f88c7" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="24">on Stellar · Soroban</text>
+</svg>

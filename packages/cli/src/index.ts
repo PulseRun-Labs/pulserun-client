@@ -10,6 +10,7 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
 import { PulseRunError } from './client/soroban.js';
+import { registerLifecycleCommands } from './commands/lifecycle.js';
 import { registerRunCommand } from './commands/run.js';
 import { registerStatusCommand } from './commands/status.js';
 import { createLogger } from './ui.js';
@@ -32,6 +33,7 @@ export function buildProgram(): Command {
 
   registerRunCommand(program);
   registerStatusCommand(program);
+  registerLifecycleCommands(program);
 
   return program;
 }

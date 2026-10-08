@@ -1,33 +1,37 @@
 /**
- * Soroban client for the PulseRun escrow contract.
+ * Soroban client for the PulseRun escrow contract (`PulseEscrow`).
  *
- * The CLI never talks to the runner directly: it locks a budget in the escrow
- * contract and then observes the on-chain job state while a runner daemon
- * executes the workload and submits an execution proof.
+ * The CLI never talks to the runner directly: it opens an escrow on-chain and
+ * then observes the job while a runner daemon executes the workload and submits
+ * an execution proof. Settlement pays the runner for the seconds actually
+ * executed and returns the unspent remainder to the requester.
  *
- * ## Expected contract interface
+ * ## Contract interface (pulserun-core)
  *
  * ```text
- * create_job(from: Address, runner: Address, image: String, cmd: String,
- *            max_budget: i128, deadline: u64) -> u64
- * get_job(job_id: u64) -> Job
- * submit_proof(runner: Address, job_id: u64, output_hash: BytesN<32>,
- *              exit_code: i32, success: bool) -> ()
+ * init(admin: Address, dispute_window_secs: u64) -> ()
+ * create_job(requester: Address, runner: Address, payment_token: Address,
+ *            max_budget: i128, rate_per_second: i128,
+ *            max_duration_secs: u64) -> u64
+ * submit_proof(runner: Address, proof: ExecutionProof) -> ()
+ * claim_payout(job_id: u64) -> i128
+ * dispute_job(requester: Address, job_id: u64) -> ()
+ * cancel_unclaimed_job(requester: Address, job_id: u64) -> ()
+ * get_job(job_id: u64) -> ComputeJob
+ * get_proof(job_id: u64) -> ExecutionProof
+ * job_count() -> u64
+ * dispute_window() -> u64
+ * admin() -> Address
  *
- * Job {
- *   job_id: u64,
- *   client: Address,
- *   runner: Address,
- *   image: String,
- *   cmd: String,
- *   max_budget: i128,   // stroops
- *   deadline: u64,      // unix seconds
- *   created_at: u64,    // unix seconds
- *   status: u32,        // see JOB_STATUSES
- *   output_hash: Option<BytesN<32>>,
- *   exit_code: Option<i32>,
+ * ComputeJob {
+ *   job_id: u64, requester: Address, runner: Address, payment_token: Address,
+ *   max_budget: i128, rate_per_second: i128, max_duration_secs: u64,
+ *   status: JobStatus, created_at: u64, completed_at: u64, output_hash: BytesN<32>,
  * }
+ * ExecutionProof { job_id: u64, duration_secs: u64, exit_code: i32, output_hash: BytesN<32> }
  * ```
+ *
+ * Amounts are in the `payment_token`'s base units; time is in ledger seconds.
  */
 
 import {
@@ -41,23 +45,29 @@ import {
   nativeToScVal,
   rpc,
   scValToNative,
+  xdr,
 } from '@stellar/stellar-sdk';
-import type { Transaction, xdr } from '@stellar/stellar-sdk';
-
-/** Number of stroops in one XLM. */
-export const STROOPS_PER_XLM = 10_000_000n;
-
-/** Default job deadline, in seconds, when the caller does not supply one. */
-export const DEFAULT_JOB_TIMEOUT_SECONDS = 3600;
+import type { Transaction } from '@stellar/stellar-sdk';
 
 /** Default delay between job status polls. */
 export const DEFAULT_POLL_INTERVAL_MS = 4_000;
 
+/** Default dispute-window wait when the caller has no contract handle. */
+export const DEFAULT_DISPUTE_WINDOW_SECONDS = 3_600;
+
 /** Contract method names, kept together so the ABI stays discoverable. */
 export const CONTRACT_METHODS = {
+  init: 'init',
   createJob: 'create_job',
-  getJob: 'get_job',
   submitProof: 'submit_proof',
+  claimPayout: 'claim_payout',
+  disputeJob: 'dispute_job',
+  cancelUnclaimedJob: 'cancel_unclaimed_job',
+  getJob: 'get_job',
+  getProof: 'get_proof',
+  jobCount: 'job_count',
+  disputeWindow: 'dispute_window',
+  admin: 'admin',
 } as const;
 
 /** Any error raised by the PulseRun client. */
@@ -67,6 +77,51 @@ export class PulseRunError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Contract error codes (ABI — branch on the number, never renumber)
+// ---------------------------------------------------------------------------
+
+export const ERROR_CODES = {
+  1: 'AlreadyInitialized',
+  2: 'NotInitialized',
+  3: 'JobNotFound',
+  4: 'ProofNotFound',
+  5: 'InvalidStatus',
+  6: 'InvalidBudget',
+  7: 'InvalidRate',
+  8: 'InvalidDuration',
+  9: 'DurationExceedsMax',
+  10: 'Unauthorized',
+  11: 'DisputeWindowActive',
+  12: 'DisputeWindowElapsed',
+  13: 'JobNotExpired',
+  14: 'MathOverflow',
+} as const;
+
+export type ContractErrorName = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+/** Resolves a numeric contract error code to its ABI name. */
+export function errorName(code: number | bigint): ContractErrorName | undefined {
+  return ERROR_CODES[Number(code) as keyof typeof ERROR_CODES];
+}
+
+/**
+ * Pulls a contract error code out of an RPC error string such as
+ * `HostError: Error(Contract, #5)`. Returns `null` when none is present.
+ */
+export function extractErrorCode(message: string): number | null {
+  const match = /Error\(Contract,\s*#(\d+)\)/.exec(message);
+  return match ? Number(match[1]) : null;
+}
+
+/** Formats an RPC error into a human message, resolving the ABI code name. */
+export function describeContractError(message: string): string {
+  const code = extractErrorCode(message);
+  if (code === null) return message;
+  const name = errorName(code);
+  return name ? `${name} (contract error #${code})` : message;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,27 +171,23 @@ export function resolveNetwork(name: string | undefined): NetworkPreset {
 // Job model
 // ---------------------------------------------------------------------------
 
-export const JOB_STATUSES = [
-  'Pending',
-  'Running',
-  'Completed',
-  'Failed',
-  'Expired',
-  'Cancelled',
-] as const;
+export const JOB_STATUSES = ['Queued', 'Completed', 'Disputed', 'Settled', 'Refunded'] as const;
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
-const TERMINAL_STATUSES: readonly JobStatus[] = ['Completed', 'Failed', 'Expired', 'Cancelled'];
+/** Statuses from which a job can no longer change state (`JobStatus::is_terminal`). */
+const TERMINAL_STATUSES: readonly JobStatus[] = ['Settled', 'Refunded'];
 
-/** True once a job can no longer change state on-chain. */
+/** True once a job reached a terminal on-chain state. */
 export function isTerminalStatus(status: JobStatus): boolean {
   return TERMINAL_STATUSES.includes(status);
 }
 
 /**
- * Maps the contract's `status` field (a `u32` discriminant, although we also
- * accept the symbol form for forward compatibility) to a `JobStatus`.
+ * Maps the contract's `status` field to a {@link JobStatus}.
+ *
+ * `#[contracttype]` unit enums are encoded as a `u32` discriminant; the symbol
+ * form is also accepted so the client survives a representation change.
  */
 export function decodeJobStatus(value: unknown): JobStatus {
   if (typeof value === 'string') {
@@ -153,105 +204,97 @@ export function decodeJobStatus(value: unknown): JobStatus {
   throw new PulseRunError('The contract did not return a usable job status.');
 }
 
-export interface JobRecord {
-  /** On-chain job identifier. */
-  id: bigint;
+/** On-chain escrow record, mirroring the contract's `ComputeJob`. */
+export interface ComputeJob {
+  jobId: bigint;
   /** Address that funded the escrow. */
-  client: string;
-  /** Address allowed to execute the job. */
+  requester: string;
+  /** Address allowed to submit the proof. */
   runner: string;
-  /** Docker image the runner must execute. */
-  image: string;
-  /** Shell command executed inside the container. */
-  command: string;
-  /** Escrowed budget in stroops. */
-  maxBudgetStroops: bigint;
-  /** Unix timestamp (seconds) after which the job expires. */
-  deadline: number;
-  /** Unix timestamp (seconds) at which the job was created. */
-  createdAt: number;
+  /** SEP-41 token (or its Stellar Asset Contract) used to denominate the job. */
+  paymentToken: string;
+  /** Absolute spend ceiling, in the token's base units. */
+  maxBudget: bigint;
+  /** Linear price charged per executed second, in base units. */
+  ratePerSecond: bigint;
+  /** Upper bound on billable seconds; also the unclaimed-job timeout. */
+  maxDurationSecs: number;
   status: JobStatus;
-  /** SHA-256 proof submitted by the runner, hex encoded, when available. */
-  outputHash: string | null;
-  exitCode: number | null;
-}
-
-/** Seconds until `deadline`, negative once the deadline has passed. */
-export function timeRemainingSeconds(deadline: number, nowSeconds: number): number {
-  return deadline - nowSeconds;
-}
-
-/** JSON-friendly projection of a {@link JobRecord}, used by `--json` output. */
-export interface JobJson {
-  jobId: string;
-  client: string;
-  runner: string;
-  image: string;
-  command: string;
-  maxBudgetXlm: string;
-  maxBudgetStroops: string;
-  deadline: number;
+  /** Ledger timestamp (seconds) the escrow opened. */
   createdAt: number;
-  status: JobStatus;
-  outputHash: string | null;
-  exitCode: number | null;
-  timeRemainingSeconds: number;
+  /** Ledger timestamp (seconds) the proof landed; `0` while queued. */
+  completedAt: number;
+  /** `0x`-prefixed SHA-256 commitment; the zero hash until a proof lands. */
+  outputHash: string;
 }
 
-export function jobToJson(job: JobRecord, nowSeconds: number): JobJson {
-  return {
-    jobId: job.id.toString(),
-    client: job.client,
-    runner: job.runner,
-    image: job.image,
-    command: job.command,
-    maxBudgetXlm: stroopsToXlm(job.maxBudgetStroops),
-    maxBudgetStroops: job.maxBudgetStroops.toString(),
-    deadline: job.deadline,
-    createdAt: job.createdAt,
-    status: job.status,
-    outputHash: job.outputHash,
-    exitCode: job.exitCode,
-    timeRemainingSeconds: timeRemainingSeconds(job.deadline, nowSeconds),
-  };
+/** Runner's attestation that a job executed, mirroring `ExecutionProof`. */
+export interface ExecutionProofRecord {
+  jobId: bigint;
+  /** Measured execution time in seconds. */
+  durationSecs: number;
+  exitCode: number;
+  outputHash: string;
+}
+
+/** Zero 32-byte hash the contract stores before a proof lands. */
+export const ZERO_HASH = `0x${'00'.repeat(32)}`;
+
+/**
+ * Unix timestamp (seconds) a `Completed` job becomes claimable once the
+ * dispute window has elapsed.
+ */
+export function payoutReleaseAt(job: ComputeJob, disputeWindowSecs: number): number {
+  return job.completedAt + disputeWindowSecs;
+}
+
+/** Seconds until a queued job's unclaimed-job timeout, negative once passed. */
+export function expirySeconds(job: ComputeJob, nowSeconds: number): number {
+  return job.createdAt + job.maxDurationSecs - nowSeconds;
 }
 
 // ---------------------------------------------------------------------------
-// XLM <-> stroops helpers
+// Token base-unit helpers
 // ---------------------------------------------------------------------------
 
 const DECIMAL_AMOUNT_RE = /^\d+(\.\d+)?$/;
 
 /**
- * Converts a decimal XLM amount into stroops without going through a float.
+ * Converts a decimal token amount into base units without going through a
+ * float, e.g. `parseTokenAmount('1.5', 7) === 15_000_000n`.
  *
  * @throws {PulseRunError} when the amount is not a positive decimal with at
- *   most 7 decimal places.
+ *   most `decimals` places.
  */
-export function xlmToStroops(amount: string | number): bigint {
+export function parseTokenAmount(amount: string | number, decimals = 7): bigint {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
+    throw new PulseRunError(`Invalid decimals "${String(decimals)}": expected 0..18.`);
+  }
   const text = (typeof amount === 'number' ? String(amount) : amount).trim();
   if (!DECIMAL_AMOUNT_RE.test(text)) {
     throw new PulseRunError(
-      `Invalid XLM amount "${text}": expected a positive decimal such as "5" or "1.25".`,
+      `Invalid amount "${text}": expected a positive decimal such as "5" or "1.25".`,
     );
   }
 
   const [whole = '0', fraction = ''] = text.split('.');
-  if (fraction.length > 7) {
+  if (fraction.length > decimals) {
     throw new PulseRunError(
-      `Invalid XLM amount "${text}": at most 7 decimal places (1 stroop) are supported.`,
+      `Invalid amount "${text}": at most ${decimals} decimal places are supported.`,
     );
   }
 
-  return BigInt(whole) * STROOPS_PER_XLM + BigInt(fraction.padEnd(7, '0'));
+  const scale = 10n ** BigInt(decimals);
+  return BigInt(whole) * scale + BigInt(fraction.padEnd(decimals, '0') || '0');
 }
 
-/** Converts stroops back into a minimal decimal XLM string. */
-export function stroopsToXlm(stroops: bigint): string {
-  const negative = stroops < 0n;
-  const absolute = negative ? -stroops : stroops;
-  const whole = absolute / STROOPS_PER_XLM;
-  const fraction = (absolute % STROOPS_PER_XLM).toString().padStart(7, '0').replace(/0+$/, '');
+/** Converts base units back into a minimal decimal string for display. */
+export function formatTokenAmount(amount: bigint, decimals = 7): string {
+  const negative = amount < 0n;
+  const absolute = negative ? -amount : amount;
+  const scale = 10n ** BigInt(decimals);
+  const whole = absolute / scale;
+  const fraction = (absolute % scale).toString().padStart(decimals, '0').replace(/0+$/, '');
   return `${negative ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`;
 }
 
@@ -278,45 +321,48 @@ function asBigInt(value: unknown, field: string): bigint {
   throw new PulseRunError(`Contract returned a non-integer "${field}".`);
 }
 
-function asOptionalBytesHex(value: unknown, field: string): string | null {
-  if (value === null || value === undefined) return null;
-  if (value instanceof Uint8Array) return `0x${Buffer.from(value).toString('hex')}`;
-  if (typeof value === 'string') {
-    if (value.length === 0 || value === '0x') return null;
-    return value.startsWith('0x') ? value : `0x${value}`;
-  }
-  throw new PulseRunError(`Contract returned an unexpected "${field}".`);
+function asInt(value: unknown, field: string): number {
+  return Number(asBigInt(value, field));
 }
 
-function asOptionalInt(value: unknown, field: string): number | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === 'number' && Number.isInteger(value)) return value;
-  if (typeof value === 'bigint') return Number(value);
-  throw new PulseRunError(`Contract returned an unexpected "${field}".`);
+/** Renders a `BytesN<32>` (or hex string) as an `0x…` hex digest. */
+export function bytesToHex(value: unknown): string {
+  if (value instanceof Uint8Array) return `0x${Buffer.from(value).toString('hex')}`;
+  if (typeof value === 'string') return value.startsWith('0x') ? value : `0x${value}`;
+  throw new PulseRunError('Contract returned a non-bytes output hash.');
 }
 
 /**
- * Converts the native value returned by `get_job` into a {@link JobRecord}.
+ * Converts the native value returned by `get_job` into a {@link ComputeJob}.
  *
  * Exported because both `pulserun status` and the polling loop in
  * `pulserun run` need identical decoding.
  */
-export function decodeJobRecord(value: unknown): JobRecord {
-  const raw = asRecord(value, 'Job');
-  const outputHash = asOptionalBytesHex(raw['output_hash'] ?? raw['outputHash'], 'output_hash');
-
+export function decodeComputeJob(value: unknown): ComputeJob {
+  const raw = asRecord(value, 'ComputeJob');
   return {
-    id: asBigInt(raw['job_id'] ?? raw['jobId'] ?? raw['id'], 'job_id'),
-    client: asString(raw['client'], 'client'),
+    jobId: asBigInt(raw['job_id'] ?? raw['jobId'], 'job_id'),
+    requester: asString(raw['requester'], 'requester'),
     runner: asString(raw['runner'], 'runner'),
-    image: asString(raw['image'], 'image'),
-    command: asString(raw['cmd'] ?? raw['command'], 'cmd'),
-    maxBudgetStroops: asBigInt(raw['max_budget'] ?? raw['maxBudget'], 'max_budget'),
-    deadline: Number(asBigInt(raw['deadline'], 'deadline')),
-    createdAt: Number(asBigInt(raw['created_at'] ?? raw['createdAt'], 'created_at')),
+    paymentToken: asString(raw['payment_token'] ?? raw['paymentToken'], 'payment_token'),
+    maxBudget: asBigInt(raw['max_budget'] ?? raw['maxBudget'], 'max_budget'),
+    ratePerSecond: asBigInt(raw['rate_per_second'] ?? raw['ratePerSecond'], 'rate_per_second'),
+    maxDurationSecs: asInt(raw['max_duration_secs'] ?? raw['maxDurationSecs'], 'max_duration_secs'),
     status: decodeJobStatus(raw['status']),
-    outputHash,
-    exitCode: asOptionalInt(raw['exit_code'] ?? raw['exitCode'], 'exit_code'),
+    createdAt: asInt(raw['created_at'] ?? raw['createdAt'], 'created_at'),
+    completedAt: asInt(raw['completed_at'] ?? raw['completedAt'], 'completed_at'),
+    outputHash: bytesToHex(raw['output_hash'] ?? raw['outputHash']),
+  };
+}
+
+/** Converts the native value returned by `get_proof` into a record. */
+export function decodeExecutionProof(value: unknown): ExecutionProofRecord {
+  const raw = asRecord(value, 'ExecutionProof');
+  return {
+    jobId: asBigInt(raw['job_id'] ?? raw['jobId'], 'job_id'),
+    durationSecs: asInt(raw['duration_secs'] ?? raw['durationSecs'], 'duration_secs'),
+    exitCode: asInt(raw['exit_code'] ?? raw['exitCode'], 'exit_code'),
+    outputHash: bytesToHex(raw['output_hash'] ?? raw['outputHash']),
   };
 }
 
@@ -357,33 +403,49 @@ export interface PulseRunClientOptions {
 }
 
 export interface CreateJobParams {
-  /** Docker image the runner must execute. */
-  image: string;
-  /** Shell command executed inside the container. */
-  command: string;
-  /** Escrowed budget in XLM (decimal string). */
-  maxBudgetXlm: string | number;
-  /** Address allowed to execute the job; defaults to the signer. */
-  runner?: string;
+  /** Address allowed to execute the job and submit the proof. */
+  runner: string;
+  /** SEP-41 token (or its SAC) used to denominate the job. */
+  paymentToken: string;
+  /** Escrowed ceiling in the token's base units. */
+  maxBudget: bigint;
+  /** Linear price per executed second, in base units. */
+  ratePerSecond: bigint;
+  /** Upper bound on billable seconds; also the unclaimed-job timeout. */
+  maxDurationSecs: number;
   /** Address funding the escrow; defaults to the signer. */
-  client?: string;
-  /** Deadline, in seconds from now. */
-  timeoutSeconds?: number;
-  /** Overrides the current unix time, in seconds; used by tests. */
-  now?: number;
+  requester?: string;
 }
 
-export interface JobSubmission {
-  jobId: bigint;
+export interface SubmitProofParams {
+  jobId: bigint | number | string;
+  /** Measured execution time in seconds (`1..=max_duration_secs`). */
+  durationSecs: number;
+  /** Process exit code reported by the runner (i32). */
+  exitCode: number;
+  /** 32-byte SHA-256 commitment, as raw bytes or a hex digest. */
+  outputHash: Uint8Array | string;
+}
+
+export interface TxResult {
   txHash: string;
   ledger: number;
+}
+
+export interface ClaimResult extends TxResult {
+  /** Payout transferred to the runner, in base units. */
+  earnings: bigint;
+}
+
+export interface JobSubmission extends TxResult {
+  jobId: bigint;
 }
 
 export interface WaitForJobOptions {
   /** Overall polling budget in milliseconds. */
   timeoutMs?: number;
   /** Called after every successful poll. */
-  onPoll?: (job: JobRecord) => void;
+  onPoll?: (job: ComputeJob) => void;
 }
 
 export class PulseRunClient {
@@ -399,7 +461,7 @@ export class PulseRunClient {
   constructor(options: PulseRunClientOptions) {
     if (!options.contractId) {
       throw new PulseRunError(
-        'A PulseRun escrow contract ID is required. Pass --contract or set PULSERUN_CONTRACT_ID.',
+        'A PulseRun escrow contract ID is required. Pass --contract or set PULSEESCROW_ID.',
       );
     }
 
@@ -424,39 +486,197 @@ export class PulseRunClient {
     return this.keypair?.publicKey();
   }
 
+  // -------------------------------------------------------------------------
+  // Writes
+  // -------------------------------------------------------------------------
+
   /**
-   * Invokes `create_job`, locking `maxBudget` XLM in escrow, and waits for the
-   * transaction to be included in a ledger.
+   * Invokes `create_job`, locking `maxBudget` base units in escrow, and waits
+   * for the transaction to be included in a ledger.
    */
   async createJob(params: CreateJobParams): Promise<JobSubmission> {
     const signer = this.requireSigner();
-    const maxBudget = xlmToStroops(params.maxBudgetXlm);
-    if (maxBudget <= 0n) {
-      throw new PulseRunError('The max budget must be greater than zero XLM.');
+
+    if (params.maxBudget <= 0n) {
+      throw new PulseRunError('The max budget must be greater than zero.');
+    }
+    if (params.ratePerSecond <= 0n) {
+      throw new PulseRunError('The rate per second must be greater than zero.');
+    }
+    if (!Number.isInteger(params.maxDurationSecs) || params.maxDurationSecs <= 0) {
+      throw new PulseRunError('The max duration must be a whole number of seconds > 0.');
     }
 
-    const timeoutSeconds = params.timeoutSeconds ?? DEFAULT_JOB_TIMEOUT_SECONDS;
-    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
-      throw new PulseRunError(`Invalid timeout "${String(timeoutSeconds)}": expected seconds > 0.`);
-    }
+    const requester = new Address(params.requester ?? signer.publicKey());
+    const runner = parseAddress(params.runner, 'runner');
+    const paymentToken = parseAddress(params.paymentToken, 'payment token');
 
-    const now = params.now ?? Math.floor(Date.now() / 1000);
-    const deadline = BigInt(now + Math.floor(timeoutSeconds));
-    const clientAddress = new Address(params.client ?? signer.publicKey());
-    const runnerAddress = new Address(params.runner ?? signer.publicKey());
-
-    const account = await this.server.getAccount(signer.publicKey());
-    const contract = new Contract(this.contractId);
-    const operation = contract.call(
+    const operation = this.contract().call(
       CONTRACT_METHODS.createJob,
-      clientAddress.toScVal(),
-      runnerAddress.toScVal(),
-      nativeToScVal(params.image, { type: 'string' }),
-      nativeToScVal(params.command, { type: 'string' }),
-      nativeToScVal(maxBudget, { type: 'i128' }),
-      nativeToScVal(deadline, { type: 'u64' }),
+      requester.toScVal(),
+      runner.toScVal(),
+      paymentToken.toScVal(),
+      nativeToScVal(params.maxBudget, { type: 'i128' }),
+      nativeToScVal(params.ratePerSecond, { type: 'i128' }),
+      nativeToScVal(params.maxDurationSecs, { type: 'u64' }),
     );
 
+    const confirmation = await this.invoke(operation, signer);
+    const returnValue = confirmation.returnValue;
+    if (!returnValue) {
+      throw new PulseRunError(
+        `create_job confirmed but returned no job id (tx: ${confirmation.txHash}). Check that the contract ID is correct.`,
+      );
+    }
+
+    return {
+      jobId: asBigInt(scValToNative(returnValue), 'job_id'),
+      txHash: confirmation.txHash,
+      ledger: confirmation.ledger,
+    };
+  }
+
+  /** Calls `submit_proof` as the runner. */
+  async submitProof(params: SubmitProofParams): Promise<TxResult> {
+    const signer = this.requireSigner();
+    const operation = this.contract().call(
+      CONTRACT_METHODS.submitProof,
+      new Address(signer.publicKey()).toScVal(),
+      encodeExecutionProof(params),
+    );
+    const confirmation = await this.invoke(operation, signer);
+    return { txHash: confirmation.txHash, ledger: confirmation.ledger };
+  }
+
+  /**
+   * Calls `claim_payout` for a completed job, returning the runner's earnings.
+   * Callable by anyone once the dispute window has elapsed.
+   */
+  async claimPayout(jobId: bigint | number | string): Promise<ClaimResult> {
+    const signer = this.requireSigner();
+    const operation = this.contract().call(
+      CONTRACT_METHODS.claimPayout,
+      nativeToScVal(toJobId(jobId), { type: 'u64' }),
+    );
+    const confirmation = await this.invoke(operation, signer);
+    const earnings = confirmation.returnValue
+      ? asBigInt(scValToNative(confirmation.returnValue), 'earnings')
+      : 0n;
+    return { txHash: confirmation.txHash, ledger: confirmation.ledger, earnings };
+  }
+
+  /** Calls `dispute_job` as the requester, halting automatic payout. */
+  async disputeJob(jobId: bigint | number | string): Promise<TxResult> {
+    return this.requesterCall(CONTRACT_METHODS.disputeJob, jobId);
+  }
+
+  /** Calls `cancel_unclaimed_job` as the requester, refunding an unclaimed job. */
+  async cancelUnclaimedJob(jobId: bigint | number | string): Promise<TxResult> {
+    return this.requesterCall(CONTRACT_METHODS.cancelUnclaimedJob, jobId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Reads (simulated, no signing key required)
+  // -------------------------------------------------------------------------
+
+  /** Reads a job's current on-chain state. */
+  async getJob(jobId: bigint | number | string): Promise<ComputeJob> {
+    const retval = await this.simulateRead(
+      CONTRACT_METHODS.getJob,
+      nativeToScVal(toJobId(jobId), { type: 'u64' }),
+    );
+    return decodeComputeJob(scValToNative(retval));
+  }
+
+  /** Reads a job's proof, or `null` when none has landed yet. */
+  async getProof(jobId: bigint | number | string): Promise<ExecutionProofRecord | null> {
+    try {
+      const retval = await this.simulateRead(
+        CONTRACT_METHODS.getProof,
+        nativeToScVal(toJobId(jobId), { type: 'u64' }),
+      );
+      return decodeExecutionProof(scValToNative(retval));
+    } catch (error) {
+      // ProofNotFound (code 4) simply means the runner has not proved yet.
+      const code = (error as { cause?: { code?: number } } | undefined)?.cause?.code;
+      if (error instanceof PulseRunError && code === 4) return null;
+      throw error;
+    }
+  }
+
+  /** Number of jobs ever created. */
+  async getJobCount(): Promise<bigint> {
+    const retval = await this.simulateRead(CONTRACT_METHODS.jobCount);
+    return asBigInt(scValToNative(retval), 'job_count');
+  }
+
+  /** Configured dispute window, in seconds. */
+  async getDisputeWindow(): Promise<number> {
+    const retval = await this.simulateRead(CONTRACT_METHODS.disputeWindow);
+    return asInt(scValToNative(retval), 'dispute_window');
+  }
+
+  /** Configured administrator address. */
+  async getAdmin(): Promise<string> {
+    const retval = await this.simulateRead(CONTRACT_METHODS.admin);
+    return asString(scValToNative(retval), 'admin');
+  }
+
+  /**
+   * Polls `get_job` until the job reaches a terminal state or `timeoutMs`
+   * elapses. The last observed record is always returned, so callers can
+   * distinguish "still open" from "finished".
+   */
+  async waitForJob(
+    jobId: bigint | number | string,
+    options: WaitForJobOptions = {},
+  ): Promise<ComputeJob> {
+    const timeoutMs = options.timeoutMs ?? 10 * 60_000;
+    const deadline = Date.now() + timeoutMs;
+
+    for (;;) {
+      const job = await this.getJob(jobId);
+      options.onPoll?.(job);
+      if (isTerminalStatus(job.status)) return job;
+      if (Date.now() >= deadline) return job;
+      await sleep(this.pollIntervalMs);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  private contract(): Contract {
+    return new Contract(this.contractId);
+  }
+
+  private requireSigner(): Keypair {
+    if (!this.keypair) {
+      throw new PulseRunError(
+        'A Stellar secret key is required to sign this transaction. Pass --key or set PULSERUN_SECRET_KEY.',
+      );
+    }
+    return this.keypair;
+  }
+
+  private async requesterCall(method: string, jobId: bigint | number | string): Promise<TxResult> {
+    const signer = this.requireSigner();
+    const operation = this.contract().call(
+      method,
+      new Address(signer.publicKey()).toScVal(),
+      nativeToScVal(toJobId(jobId), { type: 'u64' }),
+    );
+    const confirmation = await this.invoke(operation, signer);
+    return { txHash: confirmation.txHash, ledger: confirmation.ledger };
+  }
+
+  /** Builds, signs and submits a state-changing invocation. */
+  private async invoke(
+    operation: xdr.Operation,
+    signer: Keypair,
+  ): Promise<{ txHash: string; ledger: number; returnValue?: xdr.ScVal }> {
+    const account = await this.server.getAccount(signer.publicKey());
     const transaction = new TransactionBuilder(account, {
       fee: this.fee,
       networkPassphrase: this.networkPassphrase,
@@ -470,67 +690,21 @@ export class PulseRunClient {
 
     const sent = await this.server.sendTransaction(prepared);
     if (sent.status === 'ERROR') {
-      throw new PulseRunError(`The network rejected the create_job transaction (${sent.hash}).`);
+      throw new PulseRunError(`The network rejected the transaction (${sent.hash}).`);
     }
 
     const confirmation = await this.server.pollTransaction(sent.hash, { attempts: 10 });
     if (confirmation.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
       throw new PulseRunError(
-        `create_job did not confirm (status: ${confirmation.status}, tx: ${sent.hash}).`,
-      );
-    }
-
-    const returnValue = confirmation.returnValue;
-    if (!returnValue) {
-      throw new PulseRunError(
-        `create_job confirmed but returned no job id (tx: ${sent.hash}). Check that the contract ID is correct.`,
+        `Transaction did not confirm (status: ${confirmation.status}, tx: ${sent.hash}).`,
       );
     }
 
     return {
-      jobId: asBigInt(scValToNative(returnValue), 'job_id'),
       txHash: sent.hash,
       ledger: confirmation.ledger,
+      returnValue: confirmation.returnValue,
     };
-  }
-
-  /** Reads a job's current on-chain state via a read-only simulation. */
-  async getJob(jobId: bigint | number | string): Promise<JobRecord> {
-    const retval = await this.simulateRead(
-      CONTRACT_METHODS.getJob,
-      nativeToScVal(toJobId(jobId), { type: 'u64' }),
-    );
-    return decodeJobRecord(scValToNative(retval));
-  }
-
-  /**
-   * Polls `get_job` until the job reaches a terminal state or `timeoutMs`
-   * elapses. The last observed record is always returned, so callers can
-   * distinguish "still running" from "finished" with {@link isTerminalStatus}.
-   */
-  async waitForJob(
-    jobId: bigint | number | string,
-    options: WaitForJobOptions = {},
-  ): Promise<JobRecord> {
-    const timeoutMs = options.timeoutMs ?? 10 * 60_000;
-    const deadline = Date.now() + timeoutMs;
-
-    for (;;) {
-      const job = await this.getJob(jobId);
-      options.onPoll?.(job);
-      if (isTerminalStatus(job.status)) return job;
-      if (Date.now() >= deadline) return job;
-      await sleep(this.pollIntervalMs);
-    }
-  }
-
-  private requireSigner(): Keypair {
-    if (!this.keypair) {
-      throw new PulseRunError(
-        'A Stellar secret key is required to sign this transaction. Pass --key or set PULSERUN_SECRET_KEY.',
-      );
-    }
-    return this.keypair;
   }
 
   /**
@@ -540,18 +714,21 @@ export class PulseRunClient {
    */
   private async simulateRead(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
     const account = await this.resolveSourceAccount();
-    const contract = new Contract(this.contractId);
     const transaction = new TransactionBuilder(account, {
       fee: this.fee,
       networkPassphrase: this.networkPassphrase,
     })
-      .addOperation(contract.call(method, ...args))
+      .addOperation(this.contract().call(method, ...args))
       .setTimeout(30)
       .build();
 
     const simulation = await this.server.simulateTransaction(transaction);
     if (rpc.Api.isSimulationError(simulation)) {
-      throw new PulseRunError(`Simulating ${method} failed: ${simulation.error}`);
+      const code = extractErrorCode(simulation.error);
+      throw new PulseRunError(
+        `Simulating ${method} failed: ${describeContractError(simulation.error)}`,
+        code === null ? undefined : { cause: { code } },
+      );
     }
     if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
       throw new PulseRunError(
@@ -568,6 +745,64 @@ export class PulseRunClient {
     // Read-only simulation does not need a funded account; a brand new key
     // pair keeps us from forcing users to hold a key just to read state.
     return new Account(Keypair.random().publicKey(), '0');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Argument encoding
+// ---------------------------------------------------------------------------
+
+/** Encodes a `ComputeJob` proof argument as an `ExecutionProof` map ScVal. */
+export function encodeExecutionProof(params: SubmitProofParams): xdr.ScVal {
+  const exitCode = Math.trunc(params.exitCode);
+  if (!Number.isInteger(exitCode) || exitCode < -2_147_483_648 || exitCode > 2_147_483_647) {
+    throw new PulseRunError(`Exit code ${String(params.exitCode)} is not a signed 32-bit integer.`);
+  }
+  if (!Number.isInteger(params.durationSecs) || params.durationSecs <= 0) {
+    throw new PulseRunError('The proof duration must be a whole number of seconds > 0.');
+  }
+
+  const hash = toOutputHashBytes(params.outputHash);
+  return xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('job_id'),
+      val: nativeToScVal(toJobId(params.jobId), { type: 'u64' }),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('duration_secs'),
+      val: nativeToScVal(params.durationSecs, { type: 'u64' }),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('exit_code'),
+      val: nativeToScVal(exitCode, { type: 'i32' }),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol('output_hash'),
+      val: nativeToScVal(hash, { type: 'bytes' }),
+    }),
+  ]);
+}
+
+/** Normalises a hex digest or raw bytes into the 32 bytes the contract wants. */
+export function toOutputHashBytes(value: Uint8Array | string): Uint8Array {
+  const bytes =
+    typeof value === 'string'
+      ? Buffer.from(value.trim().toLowerCase().replace(/^0x/, ''), 'hex')
+      : Buffer.from(value);
+  if (bytes.length !== 32) {
+    throw new PulseRunError(`Output hash must be 32 bytes; received ${bytes.length}.`);
+  }
+  return new Uint8Array(bytes);
+}
+
+/** Validates a Stellar address string (`G...`, `C...` or `M...`). */
+export function parseAddress(value: string, field: string): Address {
+  try {
+    return new Address(value.trim());
+  } catch (error) {
+    throw new PulseRunError(`Invalid ${field} "${value}": expected a Stellar address.`, {
+      cause: error,
+    });
   }
 }
 

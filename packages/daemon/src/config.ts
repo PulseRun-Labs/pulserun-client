@@ -1,10 +1,10 @@
 /**
  * Runner daemon configuration and logging.
  *
- * The daemon is configured entirely through `PULSERUN_*` environment
- * variables so it can run as a systemd unit, a container or a Kubernetes
- * deployment without a config file. Logging lives here too because every
- * daemon module takes a {@link Logger}.
+ * The daemon is configured entirely through environment variables so it can run
+ * as a systemd unit, a container or a Kubernetes deployment without a config
+ * file. Logging lives here too because every daemon module takes a
+ * {@link Logger}.
  */
 
 import { Keypair, Networks } from '@stellar/stellar-sdk';
@@ -130,16 +130,19 @@ export interface DaemonConfig {
   network: string;
   rpcUrl: string;
   networkPassphrase: string;
+  /** PulseEscrow contract ID whose jobs are watched. */
   contractId: string;
   secretKey: string;
-  /** Public key derived from {@link secretKey}; used to match JobCreated events. */
+  /** Public key derived from {@link secretKey}; jobs for other runners are ignored. */
   runnerPublicKey: string;
-  /** Delay between event polls, in milliseconds. */
+  /** Delay between chain polls, in milliseconds. */
   pollIntervalMs: number;
-  /** How many ledgers before the head the watcher starts on first boot. */
-  startLedgerOffset: number;
-  /** Maximum number of events requested per poll. */
-  eventPageLimit: number;
+  /**
+   * JSON file mapping job id to `{ image, command }`. The contract does not
+   * carry the command line yet (pulserun-core tracks an on-chain metadata hash
+   * as planned work), so the runner reads the spec out of band.
+   */
+  jobSpecsFile: string;
   /** Docker endpoint, e.g. `unix:///var/run/docker.sock`. */
   dockerHost: string;
   /** CPU limit in cores (fractional values allowed). */
@@ -154,6 +157,8 @@ export interface DaemonConfig {
   jobTimeoutSeconds: number;
   /** Maximum number of jobs executed concurrently. */
   maxConcurrency: number;
+  /** Whether the daemon claims payouts once the dispute window has elapsed. */
+  autoClaimPayout: boolean;
   logLevel: LogLevel;
   /** Process one poll cycle and exit; useful for cron-style operation. */
   once: boolean;
@@ -166,8 +171,7 @@ export interface DaemonConfigOverrides {
 
 export const DEFAULT_CONFIG = {
   pollIntervalMs: 5_000,
-  startLedgerOffset: 100,
-  eventPageLimit: 100,
+  jobSpecsFile: './pulserun-jobs.json',
   dockerHost: 'unix:///var/run/docker.sock',
   cpuLimit: 1,
   memoryLimitMb: 1024,
@@ -175,6 +179,7 @@ export const DEFAULT_CONFIG = {
   allowNetwork: false,
   jobTimeoutSeconds: 900,
   maxConcurrency: 1,
+  autoClaimPayout: true,
   logLevel: 'info' as LogLevel,
 } as const;
 
@@ -223,11 +228,11 @@ export function loadConfig(
 ): DaemonConfig {
   const network = (env.PULSERUN_NETWORK ?? DEFAULT_NETWORK).trim();
   const preset = resolveNetwork(network);
-  const contractId = (env.PULSERUN_CONTRACT_ID ?? '').trim();
+  const contractId = (env.PULSEESCROW_ID ?? env.PULSERUN_CONTRACT_ID ?? '').trim();
   const secretKey = (env.PULSERUN_SECRET_KEY ?? '').trim();
 
   if (!contractId) {
-    throw new DaemonError('PULSERUN_CONTRACT_ID is required (the PulseRun escrow contract C...).');
+    throw new DaemonError('PULSEESCROW_ID is required (the PulseEscrow contract C...).');
   }
   if (!secretKey) {
     throw new DaemonError('PULSERUN_SECRET_KEY is required (the runner Stellar secret key S...).');
@@ -245,26 +250,15 @@ export function loadConfig(
 
   return {
     network,
-    networkPassphrase: preset.networkPassphrase,
-    rpcUrl: (env.PULSERUN_RPC_URL ?? preset.rpcUrl).trim(),
+    networkPassphrase: (env.STELLAR_NETWORK_PASSPHRASE ?? preset.networkPassphrase).trim(),
+    rpcUrl: (env.STELLAR_RPC_URL ?? env.PULSERUN_RPC_URL ?? preset.rpcUrl).trim(),
     contractId,
     secretKey,
     runnerPublicKey,
     pollIntervalMs: readInt(env, 'PULSERUN_POLL_INTERVAL_MS', DEFAULT_CONFIG.pollIntervalMs, {
       min: 250,
     }),
-    startLedgerOffset: readInt(
-      env,
-      'PULSERUN_START_LEDGER_OFFSET',
-      DEFAULT_CONFIG.startLedgerOffset,
-      {
-        min: 0,
-      },
-    ),
-    eventPageLimit: readInt(env, 'PULSERUN_EVENT_PAGE_LIMIT', DEFAULT_CONFIG.eventPageLimit, {
-      min: 1,
-      max: 200,
-    }),
+    jobSpecsFile: (env.PULSERUN_JOB_SPECS_FILE ?? DEFAULT_CONFIG.jobSpecsFile).trim(),
     dockerHost: (env.PULSERUN_DOCKER_HOST ?? DEFAULT_CONFIG.dockerHost).trim(),
     cpuLimit: readInt(env, 'PULSERUN_CPU_LIMIT', DEFAULT_CONFIG.cpuLimit, { min: 0.1, max: 64 }),
     memoryLimitMb: readInt(env, 'PULSERUN_MEMORY_LIMIT_MB', DEFAULT_CONFIG.memoryLimitMb, {
@@ -282,6 +276,7 @@ export function loadConfig(
       min: 1,
       max: 64,
     }),
+    autoClaimPayout: readBool(env, 'PULSERUN_AUTO_CLAIM', DEFAULT_CONFIG.autoClaimPayout),
     logLevel: overrides.logLevel ?? readLogLevel(env),
     once: overrides.once ?? readBool(env, 'PULSERUN_ONCE', false),
   };

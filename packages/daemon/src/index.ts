@@ -2,17 +2,23 @@
 /**
  * `pulserun-daemon` entrypoint.
  *
- * Wires the three daemon responsibilities together:
+ * Wires the runner responsibilities together:
  *
- * 1. {@link JobWatcher} polls Soroban RPC for `job_created` events addressed to
- *    this runner.
+ * 1. {@link JobWatcher} polls the escrow for `Queued` jobs addressed to this
+ *    runner (the contract emits no events yet).
  * 2. {@link DockerExecutor} runs each job in a resource-limited sandbox.
- * 3. {@link SorobanProofSubmitter} hashes the output and calls `submit_proof`
- *    so the escrow can settle.
+ * 3. The runner submits an `ExecutionProof` and, once the dispute window has
+ *    elapsed, claims the payout so the escrow settles.
  */
 
-import { rpc } from '@stellar/stellar-sdk';
 import { DaemonError, type DaemonConfig, type Logger, createLogger, loadConfig } from './config.js';
+import {
+  type ClaimResult,
+  type ComputeJob,
+  type EscrowReader,
+  type EscrowWriter,
+  RunnerEscrow,
+} from './contract.js';
 import {
   type ContainerRuntime,
   type ExecutionRequest,
@@ -20,35 +26,31 @@ import {
   DockerExecutor,
   createDockerRuntime,
 } from './executor.js';
-import {
-  type ExecutionProof,
-  type ProofSubmitter,
-  SorobanProofSubmitter,
-  buildProof,
-  formatProof,
-} from './proof.js';
-import { type JobCreatedEvent, JobWatcher } from './watcher.js';
+import { buildProof, formatProof } from './proof.js';
+import { type JobSpecStore, FileJobSpecStore } from './specs.js';
+import { JobWatcher } from './watcher.js';
 
 /** Version reported by `pulserun-daemon --version`. Keep in sync with package.json. */
 export const DAEMON_VERSION = '0.1.0';
 
 export const USAGE = `pulserun-daemon ${DAEMON_VERSION}
-Watches the PulseRun escrow contract and executes jobs in Docker sandboxes.
+Watches the PulseEscrow contract and executes jobs in Docker sandboxes.
 
 Usage: pulserun-daemon [options]
 
 Options:
-  --once       run one poll cycle, then exit (cron-friendly)
-  -h, --help   show this help
+  --once         run one poll cycle, then exit (cron-friendly)
+  -h, --help     show this help
   -v, --version  print the daemon version
 
 Configuration is read from the environment:
-  PULSERUN_CONTRACT_ID          escrow contract ID (required)
+  PULSEESCROW_ID                escrow contract ID (required)
   PULSERUN_SECRET_KEY           runner Stellar secret key (required)
   PULSERUN_NETWORK              testnet | futurenet | mainnet | local
-  PULSERUN_RPC_URL              Soroban RPC endpoint override
-  PULSERUN_POLL_INTERVAL_MS     delay between event polls
-  PULSERUN_START_LEDGER_OFFSET  ledgers behind the head to start from
+  STELLAR_RPC_URL               Soroban RPC endpoint override
+  STELLAR_NETWORK_PASSPHRASE    network passphrase override
+  PULSERUN_JOB_SPECS_FILE       JSON file mapping job id -> { image, command }
+  PULSERUN_POLL_INTERVAL_MS     delay between chain polls
   PULSERUN_DOCKER_HOST          unix://, npipe:// or tcp:// Docker endpoint
   PULSERUN_CPU_LIMIT            sandbox CPU limit in cores
   PULSERUN_MEMORY_LIMIT_MB      sandbox memory limit in MiB
@@ -56,6 +58,7 @@ Configuration is read from the environment:
   PULSERUN_ALLOW_NETWORK        true to give sandboxes network access
   PULSERUN_JOB_TIMEOUT_SECONDS  hard wall-clock limit per job
   PULSERUN_MAX_CONCURRENCY      jobs executed in parallel
+  PULSERUN_AUTO_CLAIM           claim payouts after the dispute window
   PULSERUN_LOG_LEVEL            debug | info | warn | error`;
 
 export interface ParsedArgs {
@@ -95,22 +98,26 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
 
 export interface JobProcessorDependencies {
   executor: Pick<DockerExecutor, 'execute'>;
-  submitter: ProofSubmitter;
+  escrow: EscrowWriter;
+  specs: JobSpecStore;
   logger: Logger;
   /** Overrides "now" in unix seconds; used by tests. */
   now?: () => number;
 }
 
+/** The escrow surface the runner loop uses (reads + writes). */
+export interface RunnerEscrowApi extends EscrowReader, EscrowWriter {}
+
 /**
  * Timeout for a single sandbox: the smaller of the daemon ceiling and the
- * on-chain deadline. Always at least one second.
+ * job's on-chain expiry. Always at least one second.
  */
 export function computeTimeoutSeconds(
-  deadline: number,
+  expiresAt: number,
   nowSeconds: number,
   maxTimeoutSeconds: number,
 ): number {
-  const remaining = deadline - nowSeconds;
+  const remaining = expiresAt - nowSeconds;
   if (remaining <= 0) return 0;
   return Math.max(1, Math.min(Math.floor(remaining), Math.floor(maxTimeoutSeconds)));
 }
@@ -118,31 +125,35 @@ export function computeTimeoutSeconds(
 /**
  * Executes one job and submits its proof.
  *
- * @returns the execution result, or `null` when the job's deadline had already
- *   passed and nothing was run.
- * @throws {DaemonError} when the job is malformed or proof submission fails.
+ * @returns the execution result, or `null` when the job had no spec or its
+ *   expiry had already passed.
+ * @throws {DaemonError} when proof submission fails.
  */
 export async function processJob(
-  job: JobCreatedEvent,
+  job: ComputeJob,
   deps: JobProcessorDependencies,
   maxTimeoutSeconds: number,
 ): Promise<ExecutionResult | null> {
   const logger = deps.logger;
   const nowSeconds = Math.floor((deps.now ?? Date.now)() / 1000);
-  const timeoutSeconds = computeTimeoutSeconds(job.deadline, nowSeconds, maxTimeoutSeconds);
+  const expiresAt = job.createdAt + job.maxDurationSecs;
+  const timeoutSeconds = computeTimeoutSeconds(expiresAt, nowSeconds, maxTimeoutSeconds);
 
   if (timeoutSeconds === 0) {
-    logger.warn(`Job #${job.jobId}: deadline passed ${nowSeconds - job.deadline}s ago; skipping.`);
+    logger.warn(`Job #${job.jobId}: expiry passed ${nowSeconds - expiresAt}s ago; skipping.`);
     return null;
   }
 
-  if (!job.image.trim()) throw new DaemonError(`Job #${job.jobId} has an empty image.`);
-  if (!job.command.trim()) throw new DaemonError(`Job #${job.jobId} has an empty command.`);
+  const spec = await deps.specs.get(job.jobId);
+  if (!spec) {
+    logger.warn(`Job #${job.jobId}: no spec recorded; add it to the job spec file to run it.`);
+    return null;
+  }
 
   const request: ExecutionRequest = {
     jobId: job.jobId,
-    image: job.image,
-    command: job.command,
+    image: spec.image,
+    command: spec.command,
     timeoutSeconds,
   };
 
@@ -150,28 +161,21 @@ export async function processJob(
   const proof = buildProof({
     exitCode: result.exitCode,
     logs: result.logs,
+    durationMs: result.durationMs,
     timedOut: result.timedOut,
   });
 
-  await submitProof(job, proof, deps);
-
-  return result;
-}
-
-async function submitProof(
-  job: JobCreatedEvent,
-  proof: ExecutionProof,
-  deps: JobProcessorDependencies,
-): Promise<void> {
-  const submission = await deps.submitter.submit({
+  const submission = await deps.escrow.submitProof({
     jobId: job.jobId,
-    outputHash: proof.outputHash,
+    durationSecs: proof.durationSecs,
     exitCode: proof.exitCode,
-    success: proof.success,
+    outputHash: proof.outputHash,
   });
-  deps.logger.info(
+  logger.info(
     `Job #${job.jobId}: proof submitted (${formatProof(job.jobId, proof)}) tx ${submission.txHash}, ledger ${submission.ledger}.`,
   );
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,22 +221,26 @@ export function createTaskLimiter(maxConcurrency: number): TaskLimiter {
 export interface DaemonDependencies {
   logger?: Logger;
   runtime?: ContainerRuntime;
-  submitter?: ProofSubmitter;
-  source?: {
-    getLatestLedger(): Promise<{ sequence: number }>;
-    getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse>;
-  };
+  escrow?: RunnerEscrowApi;
+  specs?: JobSpecStore;
+  /** Overrides "now" in unix seconds; used by tests. */
+  now?: () => number;
 }
 
-/** Creates the Soroban RPC server used by the watcher. */
-function createSource(config: DaemonConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, { allowHttp: config.rpcUrl.startsWith('http://') });
+/** Creates the escrow client used by the runner. */
+function createEscrow(config: DaemonConfig): RunnerEscrow {
+  return new RunnerEscrow({
+    rpcUrl: config.rpcUrl,
+    networkPassphrase: config.networkPassphrase,
+    contractId: config.contractId,
+    secretKey: config.secretKey,
+  });
 }
 
 /**
  * Runs the daemon until `signal` aborts.
  *
- * @returns the number of jobs processed (useful for `--once`).
+ * @returns the number of jobs proven (useful for `--once`).
  */
 export async function runDaemon(
   config: DaemonConfig,
@@ -240,6 +248,7 @@ export async function runDaemon(
   deps: DaemonDependencies = {},
 ): Promise<number> {
   const logger = deps.logger ?? createLogger({ level: config.logLevel });
+  const now = deps.now ?? Date.now;
 
   const runtime = deps.runtime ?? createDockerRuntime({ dockerHost: config.dockerHost });
   const executor = new DockerExecutor({
@@ -253,44 +262,62 @@ export async function runDaemon(
     },
   });
 
-  const submitter =
-    deps.submitter ??
-    new SorobanProofSubmitter({
-      rpcUrl: config.rpcUrl,
-      networkPassphrase: config.networkPassphrase,
-      contractId: config.contractId,
-      secretKey: config.secretKey,
-    });
+  const escrow = deps.escrow ?? createEscrow(config);
+  const specs = deps.specs ?? new FileJobSpecStore({ path: config.jobSpecsFile, logger });
 
   const watcher = new JobWatcher({
-    source: deps.source ?? createSource(config),
-    contractId: config.contractId,
+    source: escrow,
     runner: config.runnerPublicKey,
-    pollIntervalMs: config.pollIntervalMs,
-    startLedgerOffset: config.startLedgerOffset,
-    pageLimit: config.eventPageLimit,
     logger,
   });
 
   const limiter = createTaskLimiter(config.maxConcurrency);
-  const inFlight = new Set<Promise<void>>();
+  const inFlight = new Set<string>();
+  const tasks = new Set<Promise<void>>();
+  /** Jobs proven but not yet settled, awaiting the dispute window. */
+  const proven = new Set<string>();
   let processed = 0;
 
-  const processor: JobProcessorDependencies = { executor, submitter, logger };
+  const processor: JobProcessorDependencies = { executor, escrow, specs, logger, now };
 
-  const handleJob = async (job: JobCreatedEvent): Promise<void> => {
-    processed += 1;
+  const handleJob = async (job: ComputeJob): Promise<void> => {
     logger.info(
-      `Job #${job.jobId}: image ${job.image}, budget ${job.maxBudgetStroops} stroops, deadline ${job.deadline}`,
+      `Job #${job.jobId}: budget ${job.maxBudget} base units, duration ${job.maxDurationSecs}s.`,
     );
+    const result = await processJob(job, processor, config.jobTimeoutSeconds);
+    if (result) {
+      processed += 1;
+      proven.add(job.jobId.toString());
+    }
+  };
+
+  const reconcileClaims = async (): Promise<void> => {
+    if (!config.autoClaimPayout || proven.size === 0) return;
+    let disputeWindowSecs: number;
     try {
-      await processJob(job, processor, config.jobTimeoutSeconds);
+      disputeWindowSecs = await escrow.disputeWindow();
     } catch (error) {
-      // Leave the job alone: it will be retried on the next event poll (or
-      // expire), rather than being marked failed because of a local fault.
-      logger.error(
-        `Job #${job.jobId} failed locally: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      logger.warn(`Could not read the dispute window: ${describe(error)}`);
+      return;
+    }
+
+    const nowSeconds = Math.floor(now() / 1000);
+    for (const key of [...proven]) {
+      try {
+        const job = await escrow.getJob(BigInt(key));
+        if (job.status !== 'Completed') {
+          proven.delete(key);
+          continue;
+        }
+        if (nowSeconds < job.completedAt + disputeWindowSecs) continue;
+        const claim: ClaimResult = await escrow.claimPayout(BigInt(key));
+        logger.info(
+          `Job #${key}: settled; runner paid ${claim.earnings} base units (tx ${claim.txHash}, ledger ${claim.ledger}).`,
+        );
+        proven.delete(key);
+      } catch (error) {
+        logger.warn(`Job #${key}: claim attempt failed: ${describe(error)}`);
+      }
     }
   };
 
@@ -302,16 +329,22 @@ export async function runDaemon(
   const poll = async (): Promise<void> => {
     const jobs = await watcher.pollOnce();
     for (const job of jobs) {
+      const key = job.jobId.toString();
+      if (inFlight.has(key) || proven.has(key)) continue;
+      inFlight.add(key);
       const task = limiter
         .run(() => handleJob(job))
         .catch((error: unknown) => {
-          logger.error(`Job #${job.jobId} handler crashed: ${String(error)}`);
+          // A local failure must never submit a wrong proof: log and retry next poll.
+          logger.error(`Job #${job.jobId} failed locally: ${describe(error)}`);
         })
         .finally(() => {
-          inFlight.delete(task);
+          inFlight.delete(key);
+          tasks.delete(task);
         });
-      inFlight.add(task);
+      tasks.add(task);
     }
+    await reconcileClaims();
   };
 
   try {
@@ -319,7 +352,7 @@ export async function runDaemon(
       try {
         await poll();
       } catch (error) {
-        logger.warn(`Event poll failed: ${error instanceof Error ? error.message : String(error)}`);
+        logger.warn(`Chain poll failed: ${describe(error)}`);
       }
 
       if (config.once || signal.aborted) break;
@@ -327,11 +360,20 @@ export async function runDaemon(
     }
   } finally {
     // Wait for any sandboxes still running so a shutdown never orphans them.
-    await Promise.allSettled([...inFlight]);
+    await Promise.allSettled([...tasks]);
   }
 
-  logger.info(`pulserun-daemon stopped after processing ${processed} job(s).`);
+  // Settle anything we just proved before exiting (relevant for `--once`).
+  await reconcileClaims().catch((error: unknown) => {
+    logger.warn(`Final settle pass failed: ${describe(error)}`);
+  });
+
+  logger.info(`pulserun-daemon stopped after proving ${processed} job(s).`);
   return processed;
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Sleeps for `ms`, resolving early when the signal is aborted. */
