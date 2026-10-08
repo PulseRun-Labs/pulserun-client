@@ -1,10 +1,10 @@
 packages:
-  - 'packages/*'
+  - "packages/*"
 
 # These are optional native accelerators pulled in transitively by dockerode's
 # ssh2 dependency. PulseRun only talks to the local Docker socket, so the
 # JS fallbacks are sufficient and the native build scripts are skipped.
-ignoredBuiltDependencies:
-  - cpu-features
-  - protobufjs
-  - ssh2
+allowBuilds:
+  cpu-features: false
+  protobufjs: false
+  ssh2: false

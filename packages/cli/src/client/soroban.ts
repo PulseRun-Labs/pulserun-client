@@ -508,7 +508,10 @@ export class PulseRunClient {
    * elapses. The last observed record is always returned, so callers can
    * distinguish "still running" from "finished" with {@link isTerminalStatus}.
    */
-  async waitForJob(jobId: bigint | number | string, options: WaitForJobOptions = {}): Promise<JobRecord> {
+  async waitForJob(
+    jobId: bigint | number | string,
+    options: WaitForJobOptions = {},
+  ): Promise<JobRecord> {
     const timeoutMs = options.timeoutMs ?? 10 * 60_000;
     const deadline = Date.now() + timeoutMs;
 
@@ -535,10 +538,7 @@ export class PulseRunClient {
    * When no signer is configured we use an ephemeral source account so that
    * `pulserun status` works without holding a key.
    */
-  private async simulateRead(
-    method: string,
-    ...args: xdr.ScVal[]
-  ): Promise<xdr.ScVal> {
+  private async simulateRead(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
     const account = await this.resolveSourceAccount();
     const contract = new Contract(this.contractId);
     const transaction = new TransactionBuilder(account, {
@@ -588,7 +588,9 @@ export function toJobId(jobId: bigint | number | string): bigint {
   if (typeof jobId === 'bigint') return jobId;
   if (typeof jobId === 'number') {
     if (!Number.isInteger(jobId) || jobId < 0) {
-      throw new PulseRunError(`Invalid job id "${String(jobId)}": expected a non-negative integer.`);
+      throw new PulseRunError(
+        `Invalid job id "${String(jobId)}": expected a non-negative integer.`,
+      );
     }
     return BigInt(jobId);
   }

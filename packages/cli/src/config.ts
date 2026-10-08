@@ -70,7 +70,25 @@ export function parsePositiveSeconds(
   if (value === undefined || value === '') return fallback;
   const parsed = typeof value === 'number' ? value : Number(value.trim());
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new PulseRunError(`Invalid ${field} "${String(value)}": expected a number of seconds > 0.`);
+    throw new PulseRunError(
+      `Invalid ${field} "${String(value)}": expected a number of seconds > 0.`,
+    );
+  }
+  return Math.floor(parsed);
+}
+
+/** Parses a positive duration in milliseconds, e.g. `--poll-interval 4000`. */
+export function parsePositiveMs(
+  value: string | number | undefined,
+  field: string,
+  fallback: number,
+): number {
+  if (value === undefined || value === '') return fallback;
+  const parsed = typeof value === 'number' ? value : Number(value.trim());
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new PulseRunError(
+      `Invalid ${field} "${String(value)}": expected a number of milliseconds > 0.`,
+    );
   }
   return Math.floor(parsed);
 }
