@@ -93,7 +93,6 @@ Stellar and Soroban are load-bearing here, not decorative:
       <br />
       <a href="https://github.com/Adesh-tech09">@Adesh-tech09</a>
       <br />
-      <a href="https://t.me/PLACEHOLDER_TELEGRAM">Telegram</a>
     </td>
   </tr>
 </table>
