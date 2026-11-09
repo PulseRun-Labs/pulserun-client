@@ -90,10 +90,38 @@ killed at the earlier of the daemon's own ceiling
 (`PULSERUN_JOB_TIMEOUT_SECONDS`) and the job's on-chain expiry, and reported with
 exit code `124`.
 
-## The job-spec gap
+## Authenticated job specs
 
 The contract does not store the job's command line yet. Until pulserun-core adds
-an on-chain metadata hash, the runner reads the image and command from a local
-file keyed by job id
-(see [The job-spec gap](../README.md#the-job-spec-gap)). The escrow still
-enforces the money; the spec only tells the runner _what to run_.
+an on-chain metadata hash, the runner reads the image and command from a file
+keyed by job id — but only when the entry carries a signature from the job's
+requester. The canonical message the requester signs is:
+
+```text
+{"domain":"pulserun-job-spec","version":1,"jobId":"42","requester":"G…","image":"node:22-alpine","command":"pnpm test"}
+```
+
+The signature is Ed25519 over the UTF-8 bytes of that line, stored as `signer`
+and `signature` next to `image` and `command`. The daemon checks both the
+signature and that `signer == job.requester` before it pulls an image. An
+unsigned spec, a signature from another address, or a signature bound to a
+different job id is skipped with a log line; the escrow still enforces the
+money, and the runner never invents a command.
+
+The escrow still enforces the money; the spec only tells the runner _what to
+run_. A requester writes a signed entry with `pulserun run --spec-out`.
+
+## Verification
+
+A proof is checkable by anyone. `pulserun-verify` re-runs the signed spec with
+the same sandbox limits and compares:
+
+```text
+verified = sha256(reproduced logs) == proof.output_hash
+        && reproduced exit code   == proof.exit_code
+```
+
+`duration_secs` is billing data and is not compared. Verification is only
+meaningful for deterministic workloads with digest-pinned images; a mismatch is
+reported as "not reproduced", not as fraud. Full rules, exit codes and the
+reproducibility checklist are in [Verifying a proof](verification.md).

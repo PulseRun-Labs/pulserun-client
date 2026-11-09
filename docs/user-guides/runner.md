@@ -36,15 +36,22 @@ pulserun-daemon --once     # one poll cycle, then exit (cron-friendly)
 ## The job spec
 
 The contract pins the money and the parties, not the command line. The daemon
-reads each job's image and command from a JSON file keyed by job id:
+reads each job's image and command from a JSON file keyed by job id, and only
+trusts an entry the requester signed:
 
 ```json
 {
-  "42": { "image": "node:22-alpine", "command": "pnpm test" }
+  "42": {
+    "image": "node:22-alpine",
+    "command": "pnpm test",
+    "signer": "G_REQUESTER",
+    "signature": "base64…"
+  }
 }
 ```
 
-A requester on the same host can write an entry automatically:
+The signature is Ed25519 over the canonical spec message, checked against
+`job.requester` before the image is pulled. A requester writes it automatically:
 
 ```bash
 pulserun run --runner "$YOUR_KEY" --token "$MOCKTOKEN_ID" \
@@ -52,8 +59,10 @@ pulserun run --runner "$YOUR_KEY" --token "$MOCKTOKEN_ID" \
   --image node:22-alpine --cmd "pnpm test" --spec-out ./jobs.json
 ```
 
-If a job has no spec, the daemon logs it and leaves the job alone — it will retry
-on the next poll, or expire and refund the requester. It never invents a command.
+If a job has no spec, or its spec is unsigned or signed by another address, the
+daemon logs it and leaves the job alone — it will retry on the next poll, or
+expire and refund the requester. It never invents a command, and write access to
+the spec file is not authority to choose one.
 
 ## Safety
 
@@ -73,4 +82,10 @@ or to check on a job, use the CLI:
 ```bash
 pulserun status 42
 pulserun claim 42
+```
+
+You can also check your own work the way a requester would, without a key:
+
+```bash
+pulserun-verify 42
 ```

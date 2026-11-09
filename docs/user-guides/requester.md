@@ -26,8 +26,16 @@ pulserun run \
   --max-budget 1.5 \
   --rate 0.001 \
   --max-duration 900 \
+  --image node@sha256:… \
+  --cmd "pnpm test" \
+  --spec-out ./jobs.json \
   --network testnet
 ```
+
+`--image`, `--cmd` and `--spec-out` record the workload in a local spec file,
+signed with your requester key. A runner only executes a spec whose signature
+verifies against your address, so the command cannot be swapped by whoever can
+write that file. Pin the image by digest if you want the job to be verifiable.
 
 `run` prints the escrow confirmation and then polls until the job reaches a
 terminal state:
@@ -77,3 +85,20 @@ pulserun dispute 42
 Dispute freezes the payout. Resolution is handled by pulserun-core's dispute
 path, not automatically — see
 [Protocol mechanics](../protocol-mechanics.md#lifecycle).
+
+## Check the proof yourself
+
+Before you dispute, reproduce the job. `pulserun-verify` re-runs the signed spec
+under the same sandbox limits and compares the digest and exit code with the
+proof on-chain. It needs no key:
+
+```bash
+export PULSEESCROW_ID=C...
+export PULSERUN_JOB_SPECS_FILE=./jobs.json
+pulserun-verify 42
+```
+
+Exit code `0` means reproduced, `1` means the re-run differed, and `2` means the
+check could not run. A `1` is evidence to bring to a dispute, not a verdict:
+non-deterministic output cannot be reproduced by anyone. See
+[Verifying a proof](../verification.md).

@@ -1,9 +1,10 @@
 # PulseRun Client
 
 PulseRun is a pay-per-run compute and CI runner protocol on Stellar. This
-repository holds the **application layer**: the `pulserun` CLI for requesters and
-the `pulserun-daemon` runner. The on-chain escrow and settlement contracts live
-in [pulserun-core](https://github.com/PulseRun-Labs/pulserun-core).
+repository holds the **application layer**: the `pulserun` CLI for requesters,
+the `pulserun-daemon` runner and the `pulserun-verify` proof checker. The
+on-chain escrow and settlement contracts live in
+[pulserun-core](https://github.com/PulseRun-Labs/pulserun-core).
 
 ## The problem
 
@@ -49,6 +50,8 @@ detail in the [repository README](../README.md#built-on-stellar--soroban).
 4. If the requester challenges inside the window, `dispute_job` freezes the
    payout. If the runner never submits a proof, `cancel_unclaimed_job` refunds
    the requester in full after `max_duration_secs`.
+5. Anyone can independently check a proof with `pulserun-verify`, which re-runs
+   the requester-signed spec and compares the digest with `get_proof`.
 
 Settlement only ever moves money already held by the contract, so it cannot fail
 for lack of funds.

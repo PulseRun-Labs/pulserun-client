@@ -282,6 +282,78 @@ export function loadConfig(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Verifier configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for `pulserun-verify`.
+ *
+ * A verifier re-executes someone else's job, so it is deliberately read-only
+ * and needs no secret key. It reuses the daemon's sandbox limits so the re-run
+ * matches what the runner was allowed to consume.
+ */
+export interface VerifierConfig {
+  network: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+  contractId: string;
+  jobSpecsFile: string;
+  dockerHost: string;
+  limits: {
+    cpuLimit: number;
+    memoryLimitMb: number;
+    pidsLimit: number;
+    allowNetwork: boolean;
+  };
+  /** Cap for a single verification run, in seconds. */
+  jobTimeoutSeconds: number;
+  logLevel: LogLevel;
+}
+
+/**
+ * Loads the verifier's configuration. Unlike {@link loadConfig} it does not
+ * require `PULSERUN_SECRET_KEY`: verifying must be possible from any machine.
+ *
+ * @throws {DaemonError} when the contract ID or any override is malformed.
+ */
+export function loadVerifierConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  overrides: { logLevel?: LogLevel } = {},
+): VerifierConfig {
+  const network = (env.PULSERUN_NETWORK ?? DEFAULT_NETWORK).trim();
+  const preset = resolveNetwork(network);
+  const contractId = (env.PULSEESCROW_ID ?? env.PULSERUN_CONTRACT_ID ?? '').trim();
+
+  if (!contractId) {
+    throw new DaemonError('PULSEESCROW_ID is required (the PulseEscrow contract C...).');
+  }
+
+  return {
+    network,
+    networkPassphrase: (env.STELLAR_NETWORK_PASSPHRASE ?? preset.networkPassphrase).trim(),
+    rpcUrl: (env.STELLAR_RPC_URL ?? env.PULSERUN_RPC_URL ?? preset.rpcUrl).trim(),
+    contractId,
+    jobSpecsFile: (env.PULSERUN_JOB_SPECS_FILE ?? DEFAULT_CONFIG.jobSpecsFile).trim(),
+    dockerHost: (env.PULSERUN_DOCKER_HOST ?? DEFAULT_CONFIG.dockerHost).trim(),
+    limits: {
+      cpuLimit: readInt(env, 'PULSERUN_CPU_LIMIT', DEFAULT_CONFIG.cpuLimit, { min: 0.1, max: 64 }),
+      memoryLimitMb: readInt(env, 'PULSERUN_MEMORY_LIMIT_MB', DEFAULT_CONFIG.memoryLimitMb, {
+        min: 16,
+      }),
+      pidsLimit: readInt(env, 'PULSERUN_PIDS_LIMIT', DEFAULT_CONFIG.pidsLimit, { min: 8 }),
+      allowNetwork: readBool(env, 'PULSERUN_ALLOW_NETWORK', DEFAULT_CONFIG.allowNetwork),
+    },
+    jobTimeoutSeconds: readInt(
+      env,
+      'PULSERUN_JOB_TIMEOUT_SECONDS',
+      DEFAULT_CONFIG.jobTimeoutSeconds,
+      { min: 1 },
+    ),
+    logLevel: overrides.logLevel ?? readLogLevel(env),
+  };
+}
+
 /** Parses a `PULSERUN_DOCKER_HOST` value into dockerode connection options. */
 export function dockerOptionsFromHost(host: string): {
   socketPath?: string;

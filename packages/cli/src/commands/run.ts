@@ -21,8 +21,10 @@ import {
   PulseRunError,
   formatTokenAmount,
   isTerminalStatus,
+  parseSecretKey,
   parseTokenAmount,
 } from '../client/soroban.js';
+import { signJobSpec } from '../client/spec.js';
 import {
   parseDecimals,
   parsePositiveMs,
@@ -149,13 +151,17 @@ export async function runCommand(
   const maxBudget = parseTokenAmount(options.maxBudget, decimals);
   const ratePerSecond = parseTokenAmount(options.rate, decimals);
 
+  // One parsed keypair signs both `create_job` and the job spec, so the spec's
+  // signer is always the address the escrow records as the requester.
+  const signer = parseSecretKey(secret);
   const client =
     deps.client ??
-    PulseRunClient.fromSecretKey(secret, {
+    new PulseRunClient({
       rpcUrl: connection.rpcUrl,
       networkPassphrase: connection.networkPassphrase,
       contractId: connection.contractId,
       pollIntervalMs,
+      keypair: signer,
     });
 
   if (!options.json) {
@@ -183,7 +189,7 @@ export async function runCommand(
     );
   }
 
-  await maybeWriteSpec(options, submission.jobId);
+  await maybeWriteSpec(options, submission.jobId, signer);
 
   if (options.wait === false) {
     if (options.json) {
@@ -236,8 +242,15 @@ export async function runCommand(
   return { submission, job };
 }
 
-/** Records the job's image/command in a local spec file, when requested. */
-async function maybeWriteSpec(options: RunOptions, jobId: bigint): Promise<void> {
+/**
+ * Records the job's image/command in a local spec file, signed by the
+ * requester so a runner can prove who asked for that command.
+ */
+async function maybeWriteSpec(
+  options: RunOptions,
+  jobId: bigint,
+  signer: ReturnType<typeof parseSecretKey>,
+): Promise<void> {
   const path = options.specOut?.trim();
   if (!path) return;
   const image = (options.image ?? '').trim();
@@ -246,7 +259,10 @@ async function maybeWriteSpec(options: RunOptions, jobId: bigint): Promise<void>
     throw new PulseRunError('--spec-out requires both --image and --cmd.');
   }
 
-  let specs: Record<string, { image: string; command: string }> = {};
+  let specs: Record<
+    string,
+    { image: string; command: string; signer?: string; signature?: string }
+  > = {};
   try {
     specs = JSON.parse(await readFile(path, 'utf8')) as typeof specs;
   } catch (error) {
@@ -254,7 +270,13 @@ async function maybeWriteSpec(options: RunOptions, jobId: bigint): Promise<void>
       throw new PulseRunError(`Could not read job spec file "${path}".`, { cause: error });
     }
   }
-  specs[jobId.toString()] = { image, command };
+  const signature = signJobSpec(signer, {
+    jobId,
+    requester: signer.publicKey(),
+    image,
+    command,
+  });
+  specs[jobId.toString()] = { image, command, ...signature };
   await writeFile(path, `${JSON.stringify(specs, null, JSON_INDENT)}\n`, 'utf8');
 }
 

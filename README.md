@@ -36,8 +36,9 @@ written against that contract's published ABI.
 - [Commands](#commands)
 - [Running a daemon](#running-a-daemon)
 - [Configuration](#configuration)
-- [The job-spec gap](#the-job-spec-gap)
+- [Authenticated job specs](#authenticated-job-specs)
 - [Proof model](#proof-model)
+- [Verifying a proof](#verifying-a-proof)
 - [Security model](#security-model)
 - [Development](#development)
 - [Contributing](#contributing)
@@ -167,7 +168,9 @@ pulserun-client/
 │           ├── contract.ts       # runner-side ABI access
 │           ├── executor.ts       # Docker sandboxing + limits
 │           ├── proof.ts          # hashing + metered proof
-│           ├── specs.ts          # job-spec store
+│           ├── specs.ts          # signed job-spec store + verification
+│           ├── verify.ts         # proof re-execution + comparison
+│           ├── verify-cli.ts     # `pulserun-verify`
 │           └── config.ts         # env config + logging
 ├── docs/                # documentation site
 ├── scripts/             # issue generation + repo setup
@@ -185,6 +188,9 @@ pulserun run \
   --max-budget 1.5 \
   --rate 0.001 \
   --max-duration 900 \
+  --image node@sha256:… \
+  --cmd "pnpm test" \
+  --spec-out ./jobs.json \
   --key "$PULSERUN_SECRET_KEY" \
   --contract "$PULSEESCROW_ID" \
   --network testnet
@@ -218,12 +224,13 @@ Job #42
 
 Lifecycle commands map to the contract's entrypoints:
 
-| Command                 | Contract call          | Who signs |
-| ----------------------- | ---------------------- | --------- |
-| `pulserun run`          | `create_job`           | requester |
-| `pulserun claim <id>`   | `claim_payout`         | anyone    |
-| `pulserun dispute <id>` | `dispute_job`          | requester |
-| `pulserun cancel <id>`  | `cancel_unclaimed_job` | requester |
+| Command                 | Contract call           | Who signs |
+| ----------------------- | ----------------------- | --------- |
+| `pulserun run`          | `create_job`            | requester |
+| `pulserun claim <id>`   | `claim_payout`          | anyone    |
+| `pulserun dispute <id>` | `dispute_job`           | requester |
+| `pulserun cancel <id>`  | `cancel_unclaimed_job`  | requester |
+| `pulserun-verify <id>`  | `get_job` / `get_proof` | none      |
 
 ## Running a daemon
 
@@ -271,21 +278,45 @@ Daemon:
 Every sandbox is created with `MemorySwap` pinned to `Memory`, `PidsLimit` set,
 and `NetworkMode: none` unless `PULSERUN_ALLOW_NETWORK` is enabled.
 
-## The job-spec gap
+`pulserun-verify` reads `PULSEESCROW_ID`, `PULSERUN_NETWORK`, `STELLAR_RPC_URL`,
+the Docker host and the sandbox limit variables. It never reads a secret key.
+
+## Authenticated job specs
 
 `PulseEscrow.create_job` pins the money and the parties, but not the command
-line. Until pulserun-core lands an on-chain metadata hash, the runner reads the
-job's image and command from a JSON file keyed by job id:
+line. Until pulserun-core lands an on-chain metadata hash, the runner reads a
+job's image and command from a JSON file keyed by job id — and that file is a
+privilege boundary: whoever can write it chooses what a runner executes under
+someone else's escrow.
+
+The requester therefore signs the entry with the same key that funded the job,
+and the daemon verifies the signature against `job.requester` before pulling an
+image:
 
 ```json
-{ "42": { "image": "node:22-alpine", "command": "pnpm test" } }
+{
+  "42": {
+    "image": "node:22-alpine",
+    "command": "pnpm test",
+    "signer": "GABCDE…WXYZ12",
+    "signature": "base64…"
+  }
+}
 ```
 
-`pulserun run --image … --cmd … --spec-out ./jobs.json` appends an entry for the
-job it just created. A runner on the same host reads that file. Without a spec,
-the daemon logs and leaves the job to retry or expire — it never invents a
-command. This is an acknowledged interim mechanism, tracked in
-[`SUBMISSION.md`](SUBMISSION.md).
+`pulserun run --image … --cmd … --spec-out ./jobs.json` writes that entry after
+`create_job` succeeds. The canonical message is a single line of JSON with a
+fixed key order:
+
+```text
+{"domain":"pulserun-job-spec","version":1,"jobId":"42","requester":"G…","image":"node:22-alpine","command":"pnpm test"}
+```
+
+A spec with no signature, a signature from another address, or one bound to a
+different job id is refused: the daemon logs it and leaves the job to be fixed
+or to expire. It never invents or executes an unauthenticated command. Signing
+removes the local trust assumption while the on-chain command commitment is
+still tracked in pulserun-core.
 
 ## Proof model
 
@@ -298,9 +329,42 @@ exit_code     = container exit code (124 when the sandbox timed out)
 duration_secs = ceil(wall-clock ms / 1000), floored at 1
 ```
 
-Because the digest covers the raw logs, a verifier can re-run the same job and
+Because the digest covers the raw logs, anyone can re-run the same job and
 compare hashes without trusting the runner. Timed-out sandboxes are killed and
 reported with the conventional exit code `124`.
+
+## Verifying a proof
+
+The third role in the protocol is the verifier: a party that does not trust the
+runner. `pulserun-verify` needs Soroban RPC and Docker, but **no signing key**:
+
+```bash
+export PULSEESCROW_ID=C...
+export PULSERUN_JOB_SPECS_FILE=./jobs.json
+
+pulserun-verify 42
+```
+
+It reads `get_job` and `get_proof`, loads the requester-signed spec (or accepts
+`--image`/`--cmd` for a manual reproduction), runs the job under the same CPU,
+memory, PID and network limits, then compares the digest and exit code:
+
+```text
+Job #42 verification
+  Spec          node:22-alpine — pnpm test
+  Authorized by GABCDE…WXYZ12 (signature checked)
+  Expected      sha256:9f2c1a… exit 0
+  Reproduced    sha256:9f2c1a… exit 0 (12.4s, 1834 bytes of output)
+  Proof time    20s metered by the runner (not compared)
+Result: verified — the re-run reproduced the on-chain digest.
+```
+
+Exit codes are `0` (reproduced), `1` (different result) and `2` (could not
+verify: no proof, bad spec, Docker or RPC failure). A mismatch means the re-run
+did not reproduce the digest — clocks, randomness, network access and unpinned
+image tags all cause that — so the verdict is "not reproduced", not an
+accusation. Pin images by digest for jobs you intend to have verified. Details:
+[`docs/verification.md`](docs/verification.md).
 
 ## Security model
 
@@ -324,12 +388,14 @@ pnpm lint        # prettier --check . && eslint .
 pnpm typecheck   # tsc --noEmit for every package
 pnpm test        # vitest for every package
 pnpm build       # tsc build into packages/*/dist
+
+pnpm verify 42 --contract "$PULSEESCROW_ID"      # after building
 ```
 
 The test suites never touch the network or Docker: Soroban RPC servers, Docker
 runtimes, the job spec store and the escrow client are all injected, so hashing,
-resource-limit wiring, timeout handling and contract-call encoding are covered
-by fast unit tests.
+resource-limit wiring, timeout handling, spec signatures and contract-call
+encoding are covered by fast unit tests.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) and the
 [developer guide](docs/developer-guide.md).

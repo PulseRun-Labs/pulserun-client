@@ -6,6 +6,7 @@ import {
   CONTRACT_METHODS,
   RunnerEscrow,
   decodeComputeJob,
+  decodeExecutionProof,
   decodeJobStatus,
   encodeExecutionProof,
   toOutputHashBytes,
@@ -69,12 +70,12 @@ function createFakeServer(options: FakeServerOptions = {}): ContractRpcServer {
   };
 }
 
-function createEscrow(server: ContractRpcServer) {
+function createEscrow(server: ContractRpcServer, secretKey: string | null = SECRET) {
   return new RunnerEscrow({
     rpcUrl: 'https://example.test',
     networkPassphrase: 'Test SDF Network ; September 2015',
     contractId: CONTRACT_ID,
-    secretKey: SECRET,
+    ...(secretKey ? { secretKey } : {}),
     server,
   });
 }
@@ -100,6 +101,21 @@ describe('decoders', () => {
 
   it('rejects non-object payloads', () => {
     expect(() => decodeComputeJob('nope')).toThrowError(DaemonError);
+  });
+
+  it('maps ExecutionProof fields', () => {
+    const proof = decodeExecutionProof({
+      job_id: 7n,
+      duration_secs: 20,
+      exit_code: 0,
+      output_hash: new Uint8Array(32).fill(0xab),
+    });
+    expect(proof).toEqual({
+      jobId: 7n,
+      durationSecs: 20,
+      exitCode: 0,
+      outputHash: `0x${'ab'.repeat(32)}`,
+    });
   });
 });
 
@@ -180,6 +196,48 @@ describe('RunnerEscrow', () => {
     await expect(createEscrow(server).getJob(1n)).rejects.toThrowError(/Simulating get_job failed/);
   });
 
+  it('reads a proof, and treats ProofNotFound as "no proof yet"', async () => {
+    const proofServer = createFakeServer({
+      retval: nativeToScVal({
+        job_id: 7n,
+        duration_secs: 20n,
+        exit_code: 0,
+        output_hash: new Uint8Array(32).fill(9),
+      }),
+    });
+    await expect(createEscrow(proofServer).getProof(7n)).resolves.toEqual({
+      jobId: 7n,
+      durationSecs: 20,
+      exitCode: 0,
+      outputHash: `0x${'09'.repeat(32)}`,
+    });
+
+    const missing = createFakeServer({ simulateError: 'HostError: Error(Contract, #4)' });
+    await expect(createEscrow(missing).getProof(7n)).resolves.toBeNull();
+
+    const broken = createFakeServer({ simulateError: 'HostError: Error(Contract, #3)' });
+    await expect(createEscrow(broken).getProof(7n)).rejects.toThrowError(/Simulating get_proof/);
+  });
+
+  it('reads without a secret key and refuses to write without one', async () => {
+    const server = createFakeServer({ retval: nativeToScVal(jobFields({ status: 1 })) });
+    const readOnly = createEscrow(server, null);
+
+    expect(readOnly.publicKey).toBeUndefined();
+    await expect(readOnly.getJob(7n)).resolves.toMatchObject({ jobId: 7n });
+    // Read-only simulation uses an ephemeral source account instead of asking
+    // the RPC for a funded one.
+    expect(server.getAccount).not.toHaveBeenCalled();
+    await expect(
+      readOnly.submitProof({
+        jobId: 7n,
+        durationSecs: 1,
+        exitCode: 0,
+        outputHash: 'ab'.repeat(32),
+      }),
+    ).rejects.toThrowError(/secret key is required/);
+  });
+
   it('submits a proof and returns the receipt', async () => {
     const server = createFakeServer();
     const escrow = createEscrow(server);
@@ -212,6 +270,7 @@ describe('RunnerEscrow', () => {
       submitProof: 'submit_proof',
       claimPayout: 'claim_payout',
       getJob: 'get_job',
+      getProof: 'get_proof',
       jobCount: 'job_count',
       disputeWindow: 'dispute_window',
     });

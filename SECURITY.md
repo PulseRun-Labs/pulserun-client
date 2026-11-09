@@ -2,8 +2,9 @@
 
 PulseRun Client holds the keys and the sandboxes for PulseRun's pay-per-run
 compute protocol on Stellar. The CLI signs transactions that move funds in and
-out of the `PulseEscrow` contract, and the daemon executes untrusted jobs. A bug
-here can leak a signing key, submit a wrong proof, or escape a sandbox.
+out of the `PulseEscrow` contract, the daemon executes untrusted jobs, and the
+verifier re-executes them. A bug here can leak a signing key, submit a wrong
+proof, execute an unauthorized command, or escape a sandbox.
 
 This code is **unaudited**. It is a reference implementation; commission an
 independent review before it custodies real value.
@@ -22,6 +23,10 @@ In scope:
   math, signer handling, `--json` output.
 - The runner daemon under [`packages/daemon/`](packages/daemon/) — job discovery,
   the Docker sandbox and its limits, proof construction, payout claiming.
+- Job-spec authentication: the canonical message, signature verification, and
+  the daemon's refusal to execute an unsigned or foreign-signed spec.
+- The verifier (`pulserun-verify`, `packages/daemon/src/verify*.ts`) — the
+  comparison logic, its exit codes, and its read-only contract access.
 - Secret handling: `PULSERUN_SECRET_KEY` / `--key`, and anything that could log
   or persist a key.
 - Sandbox isolation: CPU, memory and PID limits, `NetworkMode`, timeouts, and

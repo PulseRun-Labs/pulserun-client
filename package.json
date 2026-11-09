@@ -1,6 +1,6 @@
 {
   "name": "pulserun-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Developer CLI and runner daemon for the PulseRun protocol on Stellar.",
   "license": "MIT",
@@ -27,7 +27,8 @@
     "lint:eslint": "eslint .",
     "format": "prettier --write .",
     "cli": "pnpm --filter @pulserun/cli exec node ./dist/index.js",
-    "daemon": "pnpm --filter @pulserun/daemon exec node ./dist/index.js"
+    "daemon": "pnpm --filter @pulserun/daemon exec node ./dist/index.js",
+    "verify": "pnpm --filter @pulserun/daemon exec node ./dist/verify-cli.js"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

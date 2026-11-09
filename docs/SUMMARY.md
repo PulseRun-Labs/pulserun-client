@@ -7,6 +7,7 @@
 ## Protocol
 
 - [Protocol mechanics](protocol-mechanics.md)
+- [Verifying a proof](verification.md)
 - [Architecture](architecture.md)
 - [Contract reference](contract-reference.md)
 

@@ -148,23 +148,24 @@ EOF
 # ---------------------------------------------------------------------------
 
 create_issue \
-  "feat(daemon): fetch job specs from a remote store to close the job-spec gap" \
+  "feat(daemon): fetch requester-signed job specs from a remote store" \
   "backlog,high,200pts,daemon" \
   "$(cat <<'EOF'
 ## Summary
 
 `PulseEscrow` stores no command line, so the daemon reads image/command from a
-local file. Provide a `JobSpecStore` implementation that fetches specs from a
-remote source (HTTP/git) so a runner need not share a filesystem with the
-requester. Ideally this is superseded by an on-chain metadata hash in
-pulserun-core.
+local file signed by the requester. Provide a `JobSpecStore` implementation
+that fetches specs from a remote source (HTTP/git) so a runner need not share a
+filesystem with the requester. Ideally this is superseded by an on-chain
+metadata hash in pulserun-core.
 
 ## Acceptance Criteria
 
 - [ ] New `RemoteJobSpecStore` implementing the existing `JobSpecStore` interface
 - [ ] Configurable base URL via env; timeouts and non-2xx handled with a typed error
-- [ ] Missing spec still means "skip, do not fabricate a proof"
-- [ ] Tests: happy path, 404, timeout, malformed payload
+- [ ] A fetched spec is still rejected unless the requester's signature verifies
+- [ ] Missing or invalid spec still means "skip, do not fabricate a proof"
+- [ ] Tests: happy path, 404, timeout, malformed payload, bad signature
 
 ## Tech Stack
 
@@ -353,6 +354,77 @@ audit job so a supply-chain problem fails the build.
 ## Tech Stack
 
 GitHub Actions, pnpm. Touches `.github/workflows/ci.yml`.
+EOF
+)"
+
+create_issue \
+  "feat(specs): pin images by digest and warn on mutable tags" \
+  "backlog,medium,150pts,daemon,security" \
+  "$(cat <<'EOF'
+## Summary
+
+A job is only reproducible while its image tag points at the same digest.
+`pulserun-verify` compares output hashes, so a tag that moved between the run and
+the verification turns every proof into a false mismatch. Accept and prefer
+`image@sha256:…` in a signed spec, and warn when a spec records a bare tag.
+
+## Acceptance Criteria
+
+- [ ] A spec may record `image` as `repo/name@sha256:…`; it is passed to Docker verbatim
+- [ ] `pulserun run --spec-out` warns when `--image` has no digest
+- [ ] `pulserun-verify` reports "tag, not digest" as a reproducibility warning
+- [ ] Tests: digest accepted, tag-only warns, digest mismatch still fails
+
+## Tech Stack
+
+TypeScript, Docker. Touches `packages/daemon/src/specs.ts`, `verify.ts`, `packages/cli/src/commands/run.ts`.
+EOF
+)"
+
+create_issue \
+  "test(verify): exercise digest reproduction against a real Docker runtime" \
+  "backlog,medium,150pts,testing" \
+  "$(cat <<'EOF'
+## Summary
+
+The verifier's unit tests use a fake executor, so nothing proves that a real
+sandbox reproduces a digest. Add an opt-in integration suite (skipped unless
+Docker is available) that runs a deterministic container twice and asserts the
+verifier accepts the first run's digest and rejects a tampered one.
+
+## Acceptance Criteria
+
+- [ ] `pnpm --filter @pulserun/daemon test:integration` runs only when Docker is reachable
+- [ ] Deterministic fixture image/command (pinned digest) reproduces the same hash
+- [ ] A tampered proof is reported as `verified: false` with the hash reason
+- [ ] CI job runs the suite on ubuntu-latest where Docker is available
+
+## Tech Stack
+
+Vitest, Docker. Adds `packages/daemon/test/integration/verify.integration.test.ts`.
+EOF
+)"
+
+create_issue \
+  "docs: walk through a reproducible testnet job end to end" \
+  "backlog,trivial,100pts,documentation" \
+  "$(cat <<'EOF'
+## Summary
+
+A new contributor can read the reference docs but not see the whole loop:
+create a job with a signed spec, run the daemon, watch it settle, then verify the
+proof. Write that walkthrough against testnet with real commands and output.
+
+## Acceptance Criteria
+
+- [ ] `docs/tutorials/first-job.md` covers funding, spec signing, daemon run, settlement
+- [ ] Includes a `pulserun-verify` step and explains exit codes 0/1/2
+- [ ] Every command is copy-pasteable and no key is committed
+- [ ] Linked from `README.md` and `docs/SUMMARY.md`
+
+## Tech Stack
+
+Markdown. Adds `docs/tutorials/first-job.md`.
 EOF
 )"
 

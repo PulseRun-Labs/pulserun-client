@@ -11,6 +11,8 @@
  *    elapsed, claims the payout so the escrow settles.
  */
 
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { DaemonError, type DaemonConfig, type Logger, createLogger, loadConfig } from './config.js';
 import {
   type ClaimResult,
@@ -27,11 +29,11 @@ import {
   createDockerRuntime,
 } from './executor.js';
 import { buildProof, formatProof } from './proof.js';
-import { type JobSpecStore, FileJobSpecStore } from './specs.js';
+import { type JobSpecStore, FileJobSpecStore, verifyJobSpecSignature } from './specs.js';
 import { JobWatcher } from './watcher.js';
 
 /** Version reported by `pulserun-daemon --version`. Keep in sync with package.json. */
-export const DAEMON_VERSION = '0.2.0';
+export const DAEMON_VERSION = '0.3.0';
 
 export const USAGE = `pulserun-daemon ${DAEMON_VERSION}
 Watches the PulseEscrow contract and executes jobs in Docker sandboxes.
@@ -147,6 +149,15 @@ export async function processJob(
   const spec = await deps.specs.get(job.jobId);
   if (!spec) {
     logger.warn(`Job #${job.jobId}: no spec recorded; add it to the job spec file to run it.`);
+    return null;
+  }
+  if (!verifyJobSpecSignature(job, spec)) {
+    // Refuse unsigned or foreign-signed specs: the local file is not an
+    // authority, the on-chain requester is. Skip and let the job be fixed or
+    // expire rather than executing a command nobody authorized.
+    logger.warn(
+      `Job #${job.jobId}: spec is not signed by requester ${job.requester}; refusing to run it.`,
+    );
     return null;
   }
 
@@ -461,4 +472,23 @@ export async function main(options: MainOptions = {}): Promise<number> {
       process.removeListener('SIGTERM', onSignal);
     }
   }
+}
+
+/** True when this module is the process entrypoint (follows `bin` symlinks). */
+export function isDirectExecution(argv: readonly string[] = process.argv): boolean {
+  const entry = argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+// Without this the published bin would load the module and exit without ever
+// polling, which made `pulserun-daemon` a no-op when run from `dist`.
+if (isDirectExecution()) {
+  void main().then((code) => {
+    process.exitCode = code;
+  });
 }

@@ -20,7 +20,7 @@
  */
 
 import {
-  type Account,
+  Account,
   type Transaction,
   Address,
   BASE_FEE,
@@ -39,9 +39,19 @@ export const CONTRACT_METHODS = {
   submitProof: 'submit_proof',
   claimPayout: 'claim_payout',
   getJob: 'get_job',
+  getProof: 'get_proof',
   jobCount: 'job_count',
   disputeWindow: 'dispute_window',
 } as const;
+
+/** Contract error code for a job that has no proof yet (`ProofNotFound`). */
+export const PROOF_NOT_FOUND_CODE = 4;
+
+/** Extracts a contract error code from an RPC error such as `Error(Contract, #4)`. */
+export function contractErrorCode(message: string): number | null {
+  const match = /Error\(Contract,\s*#(\d+)\)/.exec(message);
+  return match ? Number(match[1]) : null;
+}
 
 /** Lifecycle statuses, mirroring the contract's `JobStatus`. */
 export const JOB_STATUSES = ['Queued', 'Completed', 'Disputed', 'Settled', 'Refunded'] as const;
@@ -65,6 +75,14 @@ export interface ComputeJob {
 export interface TxResult {
   txHash: string;
   ledger: number;
+}
+
+/** On-chain proof record, mirroring `ExecutionProof`. */
+export interface ExecutionProofRecord {
+  jobId: bigint;
+  durationSecs: number;
+  exitCode: number;
+  outputHash: string;
 }
 
 export interface ClaimResult extends TxResult {
@@ -140,6 +158,17 @@ export function decodeJobStatus(value: unknown): JobStatus {
   throw new DaemonError('The contract did not return a usable job status.');
 }
 
+/** Converts the native value returned by `get_proof` into a record. */
+export function decodeExecutionProof(value: unknown): ExecutionProofRecord {
+  const raw = asRecord(value, 'ExecutionProof');
+  return {
+    jobId: asBigInt(raw['job_id'] ?? raw['jobId'], 'job_id'),
+    durationSecs: asInt(raw['duration_secs'] ?? raw['durationSecs'], 'duration_secs'),
+    exitCode: asInt(raw['exit_code'] ?? raw['exitCode'], 'exit_code'),
+    outputHash: bytesToHex(raw['output_hash'] ?? raw['outputHash']),
+  };
+}
+
 /** Converts the native value returned by `get_job` into a {@link ComputeJob}. */
 export function decodeComputeJob(value: unknown): ComputeJob {
   const raw = asRecord(value, 'ComputeJob');
@@ -178,8 +207,12 @@ export interface RunnerEscrowOptions {
   rpcUrl: string;
   networkPassphrase: string;
   contractId: string;
-  /** Runner secret key used to sign `submit_proof` and `claim_payout`. */
-  secretKey: string;
+  /**
+   * Runner secret key used to sign `submit_proof` and `claim_payout`. Omit it
+   * for read-only use (the verifier and any observer), where every simulated
+   * read still works but writes throw.
+   */
+  secretKey?: string;
   /** RPC override, primarily for tests. */
   server?: ContractRpcServer;
   /** Transaction fee in stroops; defaults to `BASE_FEE`. */
@@ -187,10 +220,15 @@ export interface RunnerEscrowOptions {
   pollAttempts?: number;
 }
 
-/** Reads and writes the PulseEscrow contract on behalf of a runner. */
+/**
+ * Reads and writes the PulseEscrow contract on behalf of a runner.
+ *
+ * The signer is optional: reads are simulated and need no key, so the same
+ * class backs the daemon, the CLI-side status view and the read-only verifier.
+ */
 export class RunnerEscrow implements EscrowReader, EscrowWriter {
   private readonly server: ContractRpcServer;
-  private readonly keypair: Keypair;
+  private readonly keypair: Keypair | undefined;
   private readonly fee: string;
   private readonly pollAttempts: number;
   private readonly contractId: string;
@@ -200,7 +238,7 @@ export class RunnerEscrow implements EscrowReader, EscrowWriter {
       throw new DaemonError('A PulseEscrow contract ID is required.');
     }
     this.contractId = options.contractId;
-    this.keypair = parseSecretKey(options.secretKey);
+    this.keypair = options.secretKey ? parseSecretKey(options.secretKey) : undefined;
     this.fee = options.fee ?? BASE_FEE;
     this.pollAttempts = options.pollAttempts ?? 10;
     this.server =
@@ -208,9 +246,16 @@ export class RunnerEscrow implements EscrowReader, EscrowWriter {
       new rpc.Server(options.rpcUrl, { allowHttp: options.rpcUrl.startsWith('http://') });
   }
 
-  /** The runner public key that signs every write. */
-  get publicKey(): string {
-    return this.keypair.publicKey();
+  /** The runner public key that signs every write, when a secret was supplied. */
+  get publicKey(): string | undefined {
+    return this.keypair?.publicKey();
+  }
+
+  private requireKeypair(): Keypair {
+    if (!this.keypair) {
+      throw new DaemonError('A Stellar secret key is required to sign this transaction.');
+    }
+    return this.keypair;
   }
 
   // -- reads ----------------------------------------------------------------
@@ -232,12 +277,35 @@ export class RunnerEscrow implements EscrowReader, EscrowWriter {
     return asInt(scValToNative(retval), 'dispute_window');
   }
 
+  /**
+   * Reads a job's proof, or `null` when the runner has not proved it yet.
+   * `ProofNotFound` is an expected state, not an error.
+   */
+  async getProof(jobId: bigint): Promise<ExecutionProofRecord | null> {
+    try {
+      const retval = await this.simulate(
+        CONTRACT_METHODS.getProof,
+        nativeToScVal(jobId, { type: 'u64' }),
+      );
+      return decodeExecutionProof(scValToNative(retval));
+    } catch (error) {
+      if (
+        error instanceof DaemonError &&
+        contractErrorCode(error.message) === PROOF_NOT_FOUND_CODE
+      ) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   // -- writes ---------------------------------------------------------------
 
   async submitProof(params: SubmitProofParams): Promise<TxResult> {
+    const signer = this.requireKeypair();
     const operation = this.contract().call(
       CONTRACT_METHODS.submitProof,
-      new Address(this.publicKey).toScVal(),
+      new Address(signer.publicKey()).toScVal(),
       encodeExecutionProof(params),
     );
     const { txHash, ledger } = await this.invoke(operation);
@@ -261,7 +329,7 @@ export class RunnerEscrow implements EscrowReader, EscrowWriter {
   }
 
   private async simulate(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
-    const account = await this.server.getAccount(this.publicKey);
+    const account = await this.resolveSourceAccount();
     const transaction = new TransactionBuilder(account, {
       fee: this.fee,
       networkPassphrase: this.options.networkPassphrase,
@@ -280,10 +348,21 @@ export class RunnerEscrow implements EscrowReader, EscrowWriter {
     return simulation.result.retval;
   }
 
+  /**
+   * Source account for a transaction. Reads use a throwaway account when no
+   * key is configured, so an observer can simulate without holding funds.
+   */
+  private async resolveSourceAccount(): Promise<Account> {
+    const keypair = this.keypair;
+    if (keypair) return this.server.getAccount(keypair.publicKey());
+    return new Account(Keypair.random().publicKey(), '0');
+  }
+
   private async invoke(
     operation: xdr.Operation,
   ): Promise<{ txHash: string; ledger: number; returnValue?: xdr.ScVal }> {
-    const account = await this.server.getAccount(this.publicKey);
+    const signer = this.requireKeypair();
+    const account = await this.resolveSourceAccount();
     const transaction = new TransactionBuilder(account, {
       fee: this.fee,
       networkPassphrase: this.options.networkPassphrase,
@@ -293,7 +372,7 @@ export class RunnerEscrow implements EscrowReader, EscrowWriter {
       .build();
 
     const prepared = await this.server.prepareTransaction(transaction);
-    prepared.sign(this.keypair);
+    prepared.sign(signer);
 
     const sent = await this.server.sendTransaction(prepared);
     if (sent.status === 'ERROR') {

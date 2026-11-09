@@ -7,7 +7,8 @@ supported independently.
   funds; `mock_token` exists only to exercise settlement in tests. No application
   code.
 - **`pulserun-client`** (this repo) — the application layer. A TypeScript
-  workspace with a requester CLI and a runner daemon.
+  workspace with a requester CLI, a runner daemon and a read-only proof
+  verifier.
 
 ## How they connect
 
@@ -34,8 +35,10 @@ boundary. Contract ids are passed at runtime through environment variables
         │  docker run                               │  (SEP-41 / SAC)      │
         ▼                                           └──────────────────────┘
 ┌──────────────────────┐
-│  sandbox (isolated)  │
-└──────────────────────┘
+│  sandbox (isolated)  │ ◄──── re-run ──── ┌──────────────────────┐
+└──────────────────────┘                   │  pulserun-verify     │
+                                           │  get_job/get_proof   │
+                                           └──────────────────────┘
 ```
 
 ## CLI modules
@@ -54,15 +57,17 @@ network.
 
 ## Daemon modules
 
-| Module            | Responsibility                                                                     |
-| ----------------- | ---------------------------------------------------------------------------------- |
-| `src/index.ts`    | the runner loop: poll → execute → prove → claim, with a concurrency limiter.       |
-| `src/watcher.ts`  | discovers `Queued` jobs addressed to this runner by polling `job_count`/`get_job`. |
-| `src/contract.ts` | runner-side ABI access (`RunnerEscrow`) behind `EscrowReader`/`EscrowWriter`.      |
-| `src/executor.ts` | Docker sandbox: resource limits, timeout, log capture, cleanup.                    |
-| `src/proof.ts`    | SHA-256 output hashing and the metered `ExecutionProof`.                           |
-| `src/specs.ts`    | reads the job's image/command from the local spec file.                            |
-| `src/config.ts`   | environment configuration and logging.                                             |
+| Module              | Responsibility                                                                                        |
+| ------------------- | ----------------------------------------------------------------------------------------------------- |
+| `src/index.ts`      | the runner loop: poll → execute → prove → claim, with a concurrency limiter.                          |
+| `src/watcher.ts`    | discovers `Queued` jobs addressed to this runner by polling `job_count`/`get_job`.                    |
+| `src/contract.ts`   | runner-side ABI access (`RunnerEscrow`) behind `EscrowReader`/`EscrowWriter`; reads work with no key. |
+| `src/executor.ts`   | Docker sandbox: resource limits, timeout, log capture, cleanup.                                       |
+| `src/proof.ts`      | SHA-256 output hashing and the metered `ExecutionProof`.                                              |
+| `src/specs.ts`      | reads the job's image/command and verifies the requester's signature.                                 |
+| `src/verify.ts`     | re-executes a proved job and compares hash + exit code.                                               |
+| `src/verify-cli.ts` | `pulserun-verify` entrypoint: read-only verification, exit codes.                                     |
+| `src/config.ts`     | environment configuration and logging.                                                                |
 
 ## Design choices
 
@@ -76,5 +81,11 @@ network.
 - **A local failure never submits a wrong proof.** If Docker is down or a spec is
   missing, the daemon logs and retries on the next poll; it never fabricates a
   proof to settle a job.
+- **The spec file is untrusted input.** A runner only executes a job whose
+  image and command were signed by the on-chain requester, so write access to a
+  shared file is not authority to choose a command.
+- **Reads need no key.** `RunnerEscrow` takes an optional signer and simulates
+  reads from an ephemeral source account, which is what lets `pulserun-verify`
+  check a proof from any machine.
 - **Amounts are `bigint`.** Token base units and `i128` values are never routed
   through a JavaScript `number`.

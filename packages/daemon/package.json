@@ -1,12 +1,13 @@
 {
   "name": "@pulserun/daemon",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "PulseRun runner daemon: watches the escrow contract for jobs and executes them in isolated Docker sandboxes.",
+  "description": "PulseRun runner daemon and proof verifier: executes escrowed jobs in isolated Docker sandboxes and re-runs them to check proofs.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "pulserun-daemon": "./dist/index.js"
+    "pulserun-daemon": "./dist/index.js",
+    "pulserun-verify": "./dist/verify-cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -43,6 +43,23 @@ Contract ids are read from pulserun-core's
 
 Copy `.env.example` to `.env` for local runs. `.env` is gitignored.
 
+## Verifying a proof locally
+
+`pulserun-verify` is a second binary from `@pulserun/daemon`. It needs no secret
+key, only RPC and Docker:
+
+```bash
+pnpm build
+pnpm verify 42 --contract "$PULSEESCROW_ID"
+```
+
+It reads `get_job` and `get_proof`, resolves the job's image/command from the
+spec file (verifying the requester's signature) or from `--image`/`--cmd`, then
+re-runs the job under the daemon's sandbox limits and compares the SHA-256
+digest and exit code. Exit codes: `0` reproduced, `1` not reproduced, `2` could
+not verify. See [Verifying a proof](verification.md) for the rules and the
+reproducibility checklist.
+
 ## Using the CLI programmatically
 
 Both commands and the client are exported, so the CLI is embeddable and testable.
@@ -84,8 +101,8 @@ pulserun-daemon --once   # one poll cycle, then exit
 ```
 
 The runner loads each job's image and command from `PULSERUN_JOB_SPECS_FILE`
-(see [the job-spec gap](../README.md#the-job-spec-gap)). Record an entry with the
-CLI:
+(see [authenticated job specs](../README.md#authenticated-job-specs)) and only
+executes an entry signed by the job's requester. Record an entry with the CLI:
 
 ```bash
 pulserun run --runner "$RUNNER" --token "$MOCKTOKEN_ID" \
@@ -100,8 +117,11 @@ injected:
 
 - `SorobanRpcServer` / `ContractRpcServer` — fake RPC responses.
 - `ContainerRuntime` — a fake container whose wait/logs/inspect you control.
-- `EscrowReader` / `EscrowWriter` — a fake escrow.
-- `JobSpecStore` — a fake spec source.
+- `EscrowReader` / `EscrowWriter` — a fake escrow (read-only clients need no key).
+- `JobSpecStore` — a fake spec source; signatures are made with a real keypair
+  in the suite so encoding is exercised, never against a network.
+- `DockerExecutor` — the verifier's executor is a fake, so verification tests
+  compare hashes without starting a container.
 
 ```bash
 pnpm --filter @pulserun/cli test
